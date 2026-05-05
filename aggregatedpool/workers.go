@@ -163,8 +163,8 @@ func TemporalWorkers(wDef *Workflow, actDef *Activity, nexusHandler *NexusHandle
 			log.Debug("workflow registered", zap.String(tq, wi[i].TaskQueue), zap.Any("workflow name", wf.Name), zap.Int("versioning_behavior", int(wf.VersioningBehavior)))
 		}
 
-		if nexusHandler != nil {
-			methodCancelSupported := wi[i].HasFlag("nexus_method_cancel")
+		if nexusHandler != nil && len(wi[i].NexusServices) > 0 {
+			const methodCancelSupported = true
 			for j := 0; j < len(wi[i].NexusServices); j++ {
 				svc := nexusHandler.CreateNexusService(wi[i].TaskQueue, wi[i].NexusServices[j].Name, wi[i].NexusServices[j].Operations, methodCancelSupported)
 				wrk.RegisterNexusService(svc)
