@@ -164,11 +164,10 @@ func TemporalWorkers(wDef *Workflow, actDef *Activity, nexusHandler *NexusHandle
 		}
 
 		if nexusHandler != nil && len(wi[i].NexusServices) > 0 {
-			const methodCancelSupported = true
 			for j := 0; j < len(wi[i].NexusServices); j++ {
-				svc := nexusHandler.CreateNexusService(wi[i].TaskQueue, wi[i].NexusServices[j].Name, wi[i].NexusServices[j].Operations, methodCancelSupported)
+				svc := nexusHandler.CreateNexusService(wi[i].TaskQueue, wi[i].NexusServices[j].Name, wi[i].NexusServices[j].Operations)
 				wrk.RegisterNexusService(svc)
-				log.Debug("nexus service registered", zap.String(tq, wi[i].TaskQueue), zap.String("service", wi[i].NexusServices[j].Name), zap.Int("operations", len(wi[i].NexusServices[j].Operations)), zap.Strings("ops", wi[i].NexusServices[j].Operations), zap.Bool("method_cancel_supported", methodCancelSupported))
+				log.Debug("nexus service registered", zap.String(tq, wi[i].TaskQueue), zap.String("service", wi[i].NexusServices[j].Name), zap.Int("operations", len(wi[i].NexusServices[j].Operations)), zap.Strings("ops", wi[i].NexusServices[j].Operations))
 			}
 		}
 
