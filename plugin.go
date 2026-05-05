@@ -360,7 +360,7 @@ func (p *Plugin) Reset() error {
 	workers, err := aggregatedpool.TemporalWorkers(
 		p.temporal.rrWorkflowDef,
 		p.temporal.rrActivityDef,
-		newNexusHandler(p.codec, p.actP, p.log),
+		aggregatedpool.NewNexusHandler(p.codec, p.actP, p.log),
 		wi,
 		p.log,
 		p.temporal.client,
@@ -420,14 +420,6 @@ func (p *Plugin) Name() string {
 
 func (p *Plugin) RPC() any {
 	return &rpc{plugin: p, client: p.temporal.client}
-}
-
-// newNexusHandler is a single construction site for aggregatedpool.NexusHandler.
-// initPool and Reset both rebuild workers and must mint a fresh handler bound
-// to the current codec / activity pool — go through this helper so the
-// construction signature stays in sync between both call sites.
-func newNexusHandler(codec api.Codec, actP api.Pool, log *zap.Logger) *aggregatedpool.NexusHandler {
-	return aggregatedpool.NewNexusHandler(codec, actP, log)
 }
 
 func ptr[T any](v T) *T {
