@@ -15,19 +15,19 @@ func TestNexusMethodCancellationRegistry_Lifecycle(t *testing.T) {
 	registry.Register(42)
 	state, ok := registry.Lookup(42)
 	require.True(t, ok)
-	assert.False(t, state.Cancelled)
+	assert.False(t, state.IsCanceled())
 	assert.Empty(t, state.Reason)
 
 	require.True(t, registry.Cancel(42, "context canceled"))
 	state, ok = registry.Lookup(42)
 	require.True(t, ok)
-	assert.True(t, state.Cancelled)
+	assert.True(t, state.IsCanceled())
 	assert.Equal(t, "context canceled", state.Reason)
 
 	// Cancellation is sticky and non-consuming.
 	state, ok = registry.Lookup(42)
 	require.True(t, ok)
-	assert.True(t, state.Cancelled)
+	assert.True(t, state.IsCanceled())
 
 	registry.Discard(42)
 	_, ok = registry.Lookup(42)
@@ -41,14 +41,14 @@ func TestNexusMethodCancellationRegistry_ZeroIDIsNeverRegistered(t *testing.T) {
 
 	_, ok := registry.Lookup(0)
 	assert.False(t, ok)
-	assert.False(t, registry.Cancel(0, "cancelled"))
+	assert.False(t, registry.Cancel(0, "canceled"))
 }
 
 func TestNexusMethodCancellationRegistry_Reset(t *testing.T) {
 	registry := new(NexusMethodCancellationRegistry)
 	first := registry.RegisterNew()
 	second := registry.RegisterNew()
-	require.True(t, registry.Cancel(second, "cancelled"))
+	require.True(t, registry.Cancel(second, "canceled"))
 
 	registry.Reset()
 
@@ -76,7 +76,7 @@ func TestNexusMethodCancellationRegistry_ConcurrentLifecycle(t *testing.T) {
 			registry.Cancel(id, strconv.FormatUint(id, 10))
 			state, ok := registry.Lookup(id)
 			if ok {
-				assert.True(t, state.Cancelled)
+				assert.True(t, state.IsCanceled())
 			}
 			registry.Discard(id)
 		}()

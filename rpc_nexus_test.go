@@ -16,14 +16,14 @@ func TestNexusMethodCancellationRPC_JSONContract(t *testing.T) {
 
 	active, err := json.Marshal(NexusMethodCancellationResponse{})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"cancelled":false}`, string(active))
+	assert.JSONEq(t, `{"cancelled":false}`, string(active)) //nolint:misspell // "cancelled" is the published JSON key.
 
-	cancelled, err := json.Marshal(NexusMethodCancellationResponse{
-		Cancelled: true,
+	canceled, err := json.Marshal(NexusMethodCancellationResponse{
+		Cancelled: true, //nolint:misspell // Preserve the public response field name.
 		Reason:    "context canceled",
 	})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"cancelled":true,"reason":"context canceled"}`, string(cancelled))
+	assert.JSONEq(t, `{"cancelled":true,"reason":"context canceled"}`, string(canceled)) //nolint:misspell // "cancelled" is the published JSON key.
 }
 
 func TestGetNexusMethodCancellation_ReturnsStickySnapshot(t *testing.T) {
@@ -41,7 +41,7 @@ func TestGetNexusMethodCancellation_ReturnsStickySnapshot(t *testing.T) {
 		NexusMethodCancellationRequest{InvocationID: 17},
 		&active,
 	))
-	assert.False(t, active.Cancelled)
+	assert.False(t, active.Cancelled) //nolint:misspell // Preserve the public response field name.
 	assert.Empty(t, active.Reason)
 
 	require.True(t, registry.Cancel(17, "context canceled"))
@@ -51,7 +51,7 @@ func TestGetNexusMethodCancellation_ReturnsStickySnapshot(t *testing.T) {
 		NexusMethodCancellationRequest{InvocationID: 17},
 		&first,
 	))
-	assert.True(t, first.Cancelled)
+	assert.True(t, first.Cancelled) //nolint:misspell // Preserve the public response field name.
 	assert.Equal(t, "context canceled", first.Reason)
 
 	var second NexusMethodCancellationResponse
@@ -62,7 +62,7 @@ func TestGetNexusMethodCancellation_ReturnsStickySnapshot(t *testing.T) {
 	assert.Equal(t, first, second, "polling must not consume cancellation")
 }
 
-func TestGetNexusMethodCancellation_UnknownAndZeroAreNotCancelled(t *testing.T) {
+func TestGetNexusMethodCancellation_UnknownAndZeroAreNotCanceled(t *testing.T) {
 	service := &rpc{
 		plugin: &Plugin{
 			temporal: &temporal{
@@ -77,7 +77,7 @@ func TestGetNexusMethodCancellation_UnknownAndZeroAreNotCancelled(t *testing.T) 
 			NexusMethodCancellationRequest{InvocationID: invocationID},
 			&out,
 		))
-		assert.False(t, out.Cancelled)
+		assert.False(t, out.Cancelled) //nolint:misspell // Preserve the public response field name.
 		assert.Empty(t, out.Reason)
 	}
 }

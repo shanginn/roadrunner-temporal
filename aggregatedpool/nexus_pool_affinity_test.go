@@ -94,7 +94,11 @@ func newNexusStaticPool(
 
 	gate := t.TempDir() + "/release"
 	command := func([]string) *exec.Cmd {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestNexusPoolWorkerHelper$") //nolint:gosec
+		cmd := exec.CommandContext( //nolint:gosec // The executable is the current test binary, not user input.
+			context.Background(),
+			os.Args[0],
+			"-test.run=^TestNexusPoolWorkerHelper$",
+		)
 		cmd.Env = append(
 			os.Environ(),
 			nexusPoolHelperEnv+"=1",
@@ -296,7 +300,9 @@ func waitForNexusPoolGate(gate string) error {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		_, err := os.Stat(gate)
+		// The parent test creates this exact path under t.TempDir and passes it
+		// only to its helper subprocess.
+		_, err := os.Stat(gate) //nolint:gosec
 		if err == nil {
 			return nil
 		}

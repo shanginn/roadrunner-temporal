@@ -294,11 +294,15 @@ func TestNormalizeNexusTimeoutHeaders(t *testing.T) {
 	t.Parallel()
 
 	t.Run("no timeout headers", func(t *testing.T) {
+		t.Parallel()
+
 		headers := nexus.Header{"X-Trace-ID": "trace-1"}
 		assert.Equal(t, headers, normalizeNexusTimeoutHeaders(context.Background(), headers))
 	})
 
 	t.Run("actual request deadline and operation budget become decimal milliseconds", func(t *testing.T) {
+		t.Parallel()
+
 		now := time.Now()
 		ctx, cancel := context.WithDeadline(context.Background(), now.Add(123_456_789*time.Nanosecond))
 		defer cancel()
@@ -320,6 +324,8 @@ func TestNormalizeNexusTimeoutHeaders(t *testing.T) {
 	})
 
 	t.Run("expired and malformed budgets fail closed", func(t *testing.T) {
+		t.Parallel()
+
 		now := time.Now()
 		ctx, cancel := context.WithDeadline(context.Background(), now.Add(-time.Nanosecond))
 		defer cancel()
@@ -431,7 +437,9 @@ func TestStartOperation_EncodeErrorReturnsError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, result)
-	assert.Equal(t, nexusInternalHandlerErrorMessage, err.(*nexus.HandlerError).Message)
+	var handlerError *nexus.HandlerError
+	require.True(t, errors.As(err, &handlerError))
+	assert.Equal(t, nexusInternalHandlerErrorMessage, handlerError.Message)
 	assert.NotContains(t, err.Error(), "boom")
 }
 
@@ -673,8 +681,8 @@ func TestDecodeCancelReply_FailurePropagatesHandlerError(t *testing.T) {
 
 	err := handler.decodeCancelReply(&payload.Payload{})
 
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
+	var he *nexus.HandlerError
+	require.True(t, errors.As(err, &he), "expected *nexus.HandlerError, got %T", err)
 	assert.Equal(t, nexus.HandlerErrorTypeNotImplemented, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorNonRetryable, he.RetryBehavior)
 	assert.Equal(t, "cancellation is not supported", he.Message)
@@ -696,8 +704,8 @@ func TestDecodeCancelReply_EmptyReplyIsProtocolFault(t *testing.T) {
 
 	err := handler.decodeCancelReply(&payload.Payload{})
 
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
+	var he *nexus.HandlerError
+	require.True(t, errors.As(err, &he), "expected *nexus.HandlerError, got %T", err)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorNonRetryable, he.RetryBehavior)
 }
@@ -708,8 +716,8 @@ func TestDecodeCancelReply_DecodeErrorIsInternalNonRetryable(t *testing.T) {
 
 	err := handler.decodeCancelReply(&payload.Payload{})
 
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
+	var he *nexus.HandlerError
+	require.True(t, errors.As(err, &he), "expected *nexus.HandlerError, got %T", err)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorNonRetryable, he.RetryBehavior)
 }
@@ -722,7 +730,9 @@ func TestCancelOperation_EncodeError(t *testing.T) {
 
 	err := handler.cancelOperation(context.Background(), "tq", "S", "o", "t", nexus.CancelOperationOptions{})
 	require.Error(t, err)
-	assert.Equal(t, nexusInternalHandlerErrorMessage, err.(*nexus.HandlerError).Message)
+	var handlerError *nexus.HandlerError
+	require.True(t, errors.As(err, &handlerError))
+	assert.Equal(t, nexusInternalHandlerErrorMessage, handlerError.Message)
 	assert.NotContains(t, err.Error(), "encode failed")
 }
 
@@ -809,7 +819,7 @@ func TestStartOperation_CtxCancelMarksSharedRegistry(t *testing.T) {
 
 	state, ok := registry.Lookup(5)
 	require.True(t, ok)
-	assert.True(t, state.Cancelled)
+	assert.True(t, state.IsCanceled())
 	assert.Contains(t, state.Reason, "canceled")
 }
 
@@ -833,7 +843,7 @@ func TestStartOperation_DoneClosedSkipsMethodCancel(t *testing.T) {
 
 	state, ok := registry.Lookup(5)
 	require.True(t, ok)
-	assert.False(t, state.Cancelled)
+	assert.False(t, state.IsCanceled())
 }
 
 // Race guard: ctx cancels after the invocation was discarded. The watcher must
@@ -928,7 +938,7 @@ func TestStartOperation_ContextCancelNeverDispatchesSecondPoolRequest(t *testing
 
 	require.Eventually(t, func() bool {
 		state, found := registry.Lookup(cmd.InvocationID)
-		return found && state.Cancelled
+		return found && state.IsCanceled()
 	}, time.Second, time.Millisecond)
 
 	select {
@@ -970,7 +980,7 @@ func TestCancelOperation_ContextCancelMarksRegistryAndKeepsPoolDispatchAlive(t *
 
 	require.Eventually(t, func() bool {
 		state, found := registry.Lookup(cmd.InvocationID)
-		return found && state.Cancelled
+		return found && state.IsCanceled()
 	}, time.Second, time.Millisecond)
 
 	select {
@@ -993,6 +1003,22 @@ func nexusErrorFromFailureForTest(f *failurepb.Failure) error {
 	return NewNexusHandler(nil, nil, zap.NewNop(), "default").nexusErrorFromFailure(f)
 }
 
+func requireNexusHandlerError(t *testing.T, err error) *nexus.HandlerError {
+	t.Helper()
+
+	var target *nexus.HandlerError
+	require.True(t, errors.As(err, &target), "expected *nexus.HandlerError, got %T", err)
+	return target
+}
+
+func requireNexusOperationError(t *testing.T, err error) *nexus.OperationError {
+	t.Helper()
+
+	var target *nexus.OperationError
+	require.True(t, errors.As(err, &target), "expected *nexus.OperationError, got %T", err)
+	return target
+}
+
 func TestNexusErrorFromFailure_HandlerFailureInfoPreservesType(t *testing.T) {
 	f := &failurepb.Failure{
 		Message: "payload parsing failed",
@@ -1006,8 +1032,8 @@ func TestNexusErrorFromFailure_HandlerFailureInfoPreservesType(t *testing.T) {
 
 	err := nexusErrorFromFailureForTest(f)
 
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
+	var he *nexus.HandlerError
+	require.True(t, errors.As(err, &he), "expected *nexus.HandlerError, got %T", err)
 	assert.Equal(t, nexus.HandlerErrorTypeBadRequest, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorNonRetryable, he.RetryBehavior)
 	assert.Equal(t, "payload parsing failed", he.Message)
@@ -1025,7 +1051,8 @@ func TestNexusErrorFromFailure_RetryBehaviorRetryable(t *testing.T) {
 	}
 
 	err := nexusErrorFromFailureForTest(f)
-	he := err.(*nexus.HandlerError)
+	var he *nexus.HandlerError
+	require.True(t, errors.As(err, &he))
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorRetryable, he.RetryBehavior)
 }
@@ -1040,7 +1067,8 @@ func TestNexusErrorFromFailure_RetryBehaviorUnspecifiedDefaults(t *testing.T) {
 		},
 	}
 
-	he := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
+	var he *nexus.HandlerError
+	require.True(t, errors.As(nexusErrorFromFailureForTest(f), &he))
 	assert.Equal(t, nexus.HandlerErrorTypeNotFound, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorUnspecified, he.RetryBehavior)
 }
@@ -1073,7 +1101,8 @@ func TestNexusErrorFromFailure_AllSpecErrorTypesRoundTrip(t *testing.T) {
 					},
 				},
 			}
-			he := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
+			var he *nexus.HandlerError
+			require.True(t, errors.As(nexusErrorFromFailureForTest(f), &he))
 			assert.Equal(t, c.want, he.Type)
 		})
 	}
@@ -1090,8 +1119,7 @@ func TestNexusErrorFromFailure_OperationErrorFailed(t *testing.T) {
 	}
 
 	err := nexusErrorFromFailureForTest(f)
-	oe, ok := err.(*nexus.OperationError)
-	require.True(t, ok, "expected *nexus.OperationError, got %T", err)
+	oe := requireNexusOperationError(t, err)
 	assert.Equal(t, nexus.OperationStateFailed, oe.State)
 	assert.Equal(t, "user rejected", oe.Message)
 }
@@ -1106,7 +1134,7 @@ func TestNexusErrorFromFailure_OperationErrorCanceled(t *testing.T) {
 		},
 	}
 
-	oe := nexusErrorFromFailureForTest(f).(*nexus.OperationError)
+	oe := requireNexusOperationError(t, nexusErrorFromFailureForTest(f))
 	assert.Equal(t, nexus.OperationStateCanceled, oe.State)
 	assert.Equal(t, "user canceled", oe.Message)
 }
@@ -1121,7 +1149,7 @@ func TestNexusErrorFromFailure_OperationErrorUnknownStateFallsBackToFailed(t *te
 		},
 	}
 
-	oe := nexusErrorFromFailureForTest(f).(*nexus.OperationError)
+	oe := requireNexusOperationError(t, nexusErrorFromFailureForTest(f))
 	assert.Equal(t, nexus.OperationStateFailed, oe.State, "unknown state must not leak to the wire")
 }
 
@@ -1135,8 +1163,7 @@ func TestNexusErrorFromFailure_UntaggedApplicationFailureFallsBackToInternal(t *
 		},
 	}
 
-	he, ok := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
-	require.True(t, ok)
+	he := requireNexusHandlerError(t, nexusErrorFromFailureForTest(f))
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type, "unknown failure shape must collapse to Internal")
 	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 	assert.Nil(t, he.Cause)
@@ -1145,8 +1172,7 @@ func TestNexusErrorFromFailure_UntaggedApplicationFailureFallsBackToInternal(t *
 func TestNexusErrorFromFailure_NoFailureInfoIsInternal(t *testing.T) {
 	f := &failurepb.Failure{Message: "bare failure"}
 
-	he, ok := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
-	require.True(t, ok)
+	he := requireNexusHandlerError(t, nexusErrorFromFailureForTest(f))
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 	assert.Nil(t, he.Cause)
@@ -1186,7 +1212,7 @@ func TestNexusErrorFromFailure_PublicHandlerErrorPreservesCauseProto(t *testing.
 		},
 	}
 
-	he := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
+	he := requireNexusHandlerError(t, nexusErrorFromFailureForTest(f))
 	assert.Equal(t, "boom", he.Message)
 
 	roundTripped := temporal.GetDefaultFailureConverter().ErrorToFailure(he.Cause)
@@ -1211,7 +1237,7 @@ func TestNexusErrorFromFailure_PublicHandlerErrorPreservesNestedCauseProto(t *te
 		},
 	}
 
-	he := nexusErrorFromFailureForTest(outer).(*nexus.HandlerError)
+	he := requireNexusHandlerError(t, nexusErrorFromFailureForTest(outer))
 	roundTripped := temporal.GetDefaultFailureConverter().ErrorToFailure(he.Cause)
 	assert.True(t, proto.Equal(outer, roundTripped),
 		"recursive cause chain must survive round-trip;\nwant: %v\ngot:  %v", outer, roundTripped)
@@ -1228,7 +1254,7 @@ func TestNexusErrorFromFailure_InternalCauseIsLoggedAndHidden(t *testing.T) {
 		},
 	}
 
-	he := handler.nexusErrorFromFailure(f).(*nexus.HandlerError)
+	he := requireNexusHandlerError(t, handler.nexusErrorFromFailure(f))
 
 	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 	assert.NotContains(t, he.Error(), "password=secret")
@@ -1266,7 +1292,7 @@ func TestNexusErrorFromFailure_OperationErrorPreservesCauseProto(t *testing.T) {
 		},
 	}
 
-	oe := nexusErrorFromFailureForTest(outer).(*nexus.OperationError)
+	oe := requireNexusOperationError(t, nexusErrorFromFailureForTest(outer))
 	assert.Equal(t, nexus.OperationStateFailed, oe.State)
 	assert.Equal(t, "outer-business-error", oe.Message)
 
@@ -1400,8 +1426,7 @@ func TestDecodeStartReply_NilCommandWithFailureRoutesToMapping(t *testing.T) {
 	res, err := handler.decodeStartReply(context.Background(), msg)
 	assert.Nil(t, res)
 	require.Error(t, err)
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
+	he := requireNexusHandlerError(t, err)
 	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 	assert.NotContains(t, he.Error(), "boom")
 }
@@ -1413,8 +1438,7 @@ func TestDecodeStartReply_EmptyReplyIsHandlerError(t *testing.T) {
 	res, err := handler.decodeStartReply(context.Background(), &internal.Message{})
 	assert.Nil(t, res)
 	require.Error(t, err)
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
+	he := requireNexusHandlerError(t, err)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 }
@@ -1429,8 +1453,7 @@ func TestDecodeStartReply_UnknownCommandIsHandlerError(t *testing.T) {
 	res, err := handler.decodeStartReply(context.Background(), msg)
 	assert.Nil(t, res)
 	require.Error(t, err)
-	he, ok := err.(*nexus.HandlerError)
-	require.True(t, ok)
+	he := requireNexusHandlerError(t, err)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 }

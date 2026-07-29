@@ -365,6 +365,8 @@ func (h *NexusHandler) nexusErrorFromFailure(f *failurepb.Failure) error {
 
 func mapNexusRetryBehavior(b enumspb.NexusHandlerErrorRetryBehavior) nexus.HandlerErrorRetryBehavior {
 	switch b {
+	case enumspb.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_UNSPECIFIED:
+		return nexus.HandlerErrorRetryBehaviorUnspecified
 	case enumspb.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE:
 		return nexus.HandlerErrorRetryBehaviorRetryable
 	case enumspb.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE:
@@ -408,7 +410,7 @@ func (h *NexusHandler) cancelOperation(
 
 	// Cancel handlers receive the same cooperative method-cancellation contract
 	// as Start handlers. Keep the PHP request alive after the original Nexus
-	// context is cancelled so it can poll and finish its bounded cleanup.
+	// context is canceled so it can poll and finish its bounded cleanup.
 	r, err := h.roundTrip(context.WithoutCancel(ctx), taskQueue, msg, "nexus cancel request")
 	if err != nil {
 		return err
@@ -554,7 +556,7 @@ func (h *NexusHandler) newNexusHandlerError(typ nexus.HandlerErrorType, retry ne
 func (h *NexusHandler) watchForMethodCancel(ctx context.Context, invocationID uint64, done <-chan struct{}) {
 	select {
 	case <-ctx.Done():
-		reason := "Nexus handler context cancelled"
+		reason := "Nexus handler context cancelled" //nolint:misspell // Preserve the established PHP-visible reason.
 		if cause := context.Cause(ctx); cause != nil {
 			reason = cause.Error()
 		}

@@ -53,9 +53,9 @@ type NexusMethodCancellationRequest struct {
 }
 
 // NexusMethodCancellationResponse is a non-consuming snapshot. Unknown and
-// already-completed invocation IDs are reported as not cancelled.
+// already-completed invocation IDs are reported as not canceled.
 type NexusMethodCancellationResponse struct {
-	Cancelled bool   `json:"cancelled"`
+	Cancelled bool   `json:"cancelled"` //nolint:misspell // Public field and JSON names are compatibility contracts.
 	Reason    string `json:"reason,omitempty"`
 }
 
@@ -156,7 +156,7 @@ func (r *rpc) GetNexusMethodCancellation(in NexusMethodCancellationRequest, out 
 	}
 
 	*out = NexusMethodCancellationResponse{
-		Cancelled: state.Cancelled,
+		Cancelled: state.IsCanceled(), //nolint:misspell // Preserve the public response field name.
 		Reason:    state.Reason,
 	}
 	return nil

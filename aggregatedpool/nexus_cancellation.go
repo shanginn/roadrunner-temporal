@@ -8,8 +8,13 @@ import (
 // NexusMethodCancellation is the current cooperative-cancellation state of one
 // in-flight Nexus handler method.
 type NexusMethodCancellation struct {
-	Cancelled bool
+	Cancelled bool //nolint:misspell // Preserve the exported field name for source compatibility.
 	Reason    string
+}
+
+// IsCanceled reports whether cancellation was observed.
+func (s NexusMethodCancellation) IsCanceled() bool {
+	return s.Cancelled //nolint:misspell // Read the compatibility field through a correctly spelled API.
 }
 
 // NexusMethodCancellationRegistry keeps handler-method cancellation state in
@@ -24,7 +29,7 @@ type NexusMethodCancellationRegistry struct {
 
 // RegisterNew allocates and registers an invocation ID. The sequence is not
 // reset when entries are cleared, preventing a late watcher from an old worker
-// pool from cancelling a newly registered invocation after plugin reset.
+// pool from canceling a newly registered invocation after plugin reset.
 func (r *NexusMethodCancellationRegistry) RegisterNew() uint64 {
 	id := r.nextID.Add(1)
 	if id == 0 {
@@ -34,7 +39,7 @@ func (r *NexusMethodCancellationRegistry) RegisterNew() uint64 {
 	return id
 }
 
-// Register marks an invocation active and not cancelled.
+// Register marks an invocation active and not canceled.
 func (r *NexusMethodCancellationRegistry) Register(invocationID uint64) {
 	if invocationID == 0 {
 		return
@@ -49,7 +54,7 @@ func (r *NexusMethodCancellationRegistry) Register(invocationID uint64) {
 	r.entries[invocationID] = NexusMethodCancellation{}
 }
 
-// Cancel marks an active invocation cancelled. It returns false when the
+// Cancel marks an active invocation canceled. It returns false when the
 // invocation has already completed (or was never registered).
 func (r *NexusMethodCancellationRegistry) Cancel(invocationID uint64, reason string) bool {
 	r.mu.Lock()
@@ -59,11 +64,11 @@ func (r *NexusMethodCancellationRegistry) Cancel(invocationID uint64, reason str
 	if !ok {
 		return false
 	}
-	if state.Cancelled {
+	if state.IsCanceled() {
 		return true
 	}
 
-	state.Cancelled = true
+	state.Cancelled = true //nolint:misspell // Preserve the exported field name for source compatibility.
 	state.Reason = reason
 	r.entries[invocationID] = state
 	return true
