@@ -37,13 +37,16 @@ checkout, use the pinned direct-source builder:
 ./build-local.sh
 ```
 
-It clones RoadRunner `v2025.1.15`, pins Go 1.26.4, replaces the bundled
-Temporal plugin with this repository, resolves the module graph, and writes
-`rr-nexus`. Override only when intentionally testing a different host release
-or output path:
+It fetches RoadRunner `v2025.1.15` at immutable commit
+`321b817fab1056e404533ca1ddd200e77d1525fd`, pins Go 1.26.4, replaces the
+bundled Temporal plugin with this repository, resolves the module graph, and
+writes `rr-nexus`. Override only when intentionally testing a different host
+commit or output path:
 
 ```bash
-ROADRUNNER_REF=v2025.1.15 ROADRUNNER_BINARY=/absolute/path/to/rr-nexus ./build-local.sh
+ROADRUNNER_REF=321b817fab1056e404533ca1ddd200e77d1525fd \
+ROADRUNNER_BINARY=/absolute/path/to/rr-nexus \
+./build-local.sh
 ```
 
 The exact binary used by acceptance tests is

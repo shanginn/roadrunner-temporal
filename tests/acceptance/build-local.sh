@@ -4,7 +4,9 @@ set -euo pipefail
 
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly plugin_root="$(cd -- "${script_dir}/../.." && pwd)"
-readonly rr_ref="${ROADRUNNER_REF:-v2025.1.15}"
+# RoadRunner v2025.1.15. Use the immutable commit so repeated builds cannot
+# silently move if the release tag is ever retargeted.
+readonly rr_ref="${ROADRUNNER_REF:-321b817fab1056e404533ca1ddd200e77d1525fd}"
 readonly output="${ROADRUNNER_BINARY:-${script_dir}/rr-nexus}"
 readonly build_root="$(mktemp -d "${TMPDIR:-/tmp}/rr-nexus-build.XXXXXX")"
 
@@ -13,9 +15,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-git clone --quiet --depth 1 --branch "${rr_ref}" \
-    https://github.com/roadrunner-server/roadrunner.git \
-    "${build_root}/roadrunner"
+git init --quiet "${build_root}/roadrunner"
+git -C "${build_root}/roadrunner" remote add origin \
+    https://github.com/roadrunner-server/roadrunner.git
+git -C "${build_root}/roadrunner" fetch --quiet --depth 1 origin "${rr_ref}"
+git -C "${build_root}/roadrunner" checkout --quiet --detach FETCH_HEAD
 
 cd -- "${build_root}/roadrunner"
 go mod edit -go=1.26.4

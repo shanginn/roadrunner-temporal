@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/roadrunner-server/goridge/v3/pkg/frame"
 	"github.com/roadrunner-server/pool/payload"
@@ -30,6 +31,8 @@ const nexusOperationErrorTypePrefix = "nexus.OperationError."
 const (
 	nexusInternalHandlerErrorMessage    = "internal Nexus handler error"
 	nexusUnavailableHandlerErrorMessage = "Nexus handler unavailable"
+	nexusRequestTimeoutHeader           = "Request-Timeout"
+	nexusOperationTimeoutHeader         = "Operation-Timeout"
 )
 
 // NexusHandler forwards handler-side Nexus Start/Cancel to PHP via the activity pool.
@@ -156,7 +159,7 @@ func (h *NexusHandler) startOperation(
 			RequestID:       options.RequestID,
 			Callback:        options.CallbackURL,
 			CallbackHeaders: maps.Clone(options.CallbackHeader),
-			Headers:         maps.Clone(options.Header),
+			Headers:         normalizeNexusTimeoutHeaders(ctx, options.Header),
 			Links:           links,
 			InvocationID:    invocationID,
 		},
@@ -391,7 +394,7 @@ func (h *NexusHandler) cancelOperation(
 			TaskQueue:      taskQueue,
 			Endpoint:       h.endpoint(ctx),
 			OperationToken: token,
-			Headers:        maps.Clone(options.Header),
+			Headers:        normalizeNexusTimeoutHeaders(ctx, options.Header),
 			InvocationID:   invocationID,
 		},
 	}
@@ -412,6 +415,90 @@ func (h *NexusHandler) cancelOperation(
 	}
 
 	return h.decodeCancelReply(r)
+}
+
+// normalizeNexusTimeoutHeaders translates Go duration syntax into the Nexus
+// timeout wire grammar before handing headers to PHP.
+//
+// Request-Timeout is bounded by the handler context's current remaining
+// deadline, not merely the duration captured when the task was received.
+// Operation-Timeout has no separate deadline on the handler context, so its
+// shortest supplied value remains authoritative. HTTP header names are
+// case-insensitive, but nexus.Header is a Go map and may contain duplicate
+// spellings; every timeout is therefore collapsed to one canonical field.
+func normalizeNexusTimeoutHeaders(ctx context.Context, headers nexus.Header) nexus.Header {
+	return normalizeNexusTimeoutHeadersAt(ctx, headers, time.Now())
+}
+
+func normalizeNexusTimeoutHeadersAt(ctx context.Context, headers nexus.Header, now time.Time) nexus.Header {
+	normalized := maps.Clone(headers)
+	var (
+		requestTimeout   time.Duration
+		requestFound     bool
+		operationTimeout time.Duration
+		operationFound   bool
+	)
+
+	for name, value := range normalized {
+		var (
+			timeout *time.Duration
+			found   *bool
+		)
+		switch {
+		case strings.EqualFold(name, nexusRequestTimeoutHeader):
+			timeout = &requestTimeout
+			found = &requestFound
+		case strings.EqualFold(name, nexusOperationTimeoutHeader):
+			timeout = &operationTimeout
+			found = &operationFound
+		default:
+			continue
+		}
+
+		delete(normalized, name)
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			duration = 0
+		}
+		if !*found || duration < *timeout {
+			*timeout = duration
+		}
+		*found = true
+	}
+
+	if requestFound {
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := deadline.Sub(now)
+			if remaining < requestTimeout {
+				requestTimeout = remaining
+			}
+		}
+		normalized[nexusRequestTimeoutHeader] = formatNexusTimeout(requestTimeout)
+	}
+	if operationFound {
+		normalized[nexusOperationTimeoutHeader] = formatNexusTimeout(operationTimeout)
+	}
+
+	return normalized
+}
+
+// formatNexusTimeout preserves a time.Duration's nanosecond precision as a
+// non-negative decimal millisecond value. It deliberately avoids
+// time.Duration.String(), whose µs, ns, h, and negative forms are outside the
+// pinned Nexus timeout grammar accepted by the PHP SDK.
+func formatNexusTimeout(duration time.Duration) string {
+	if duration <= 0 {
+		return "0ms"
+	}
+
+	milliseconds := duration / time.Millisecond
+	nanoseconds := duration % time.Millisecond
+	if nanoseconds == 0 {
+		return fmt.Sprintf("%dms", milliseconds)
+	}
+
+	fraction := strings.TrimRight(fmt.Sprintf("%06d", nanoseconds), "0")
+	return fmt.Sprintf("%d.%sms", milliseconds, fraction)
 }
 
 // decodeCancelReply maps the PHP cancel reply: always exactly one message; a

@@ -3,6 +3,7 @@ package aggregatedpool
 import (
 	"context"
 	"errors"
+	"maps"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -232,6 +233,142 @@ func TestStartOperation_EncodesAllFields(t *testing.T) {
 	assert.Equal(t, "callback-token", cmd.CallbackHeaders["X-Token"])
 }
 
+func TestFormatNexusTimeout(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		duration time.Duration
+		expected string
+	}{
+		"expired": {
+			duration: -33_542 * time.Nanosecond,
+			expected: "0ms",
+		},
+		"zero": {
+			duration: 0,
+			expected: "0ms",
+		},
+		"one nanosecond": {
+			duration: time.Nanosecond,
+			expected: "0.000001ms",
+		},
+		"positive sub-millisecond": {
+			duration: 999_999 * time.Nanosecond,
+			expected: "0.999999ms",
+		},
+		"whole millisecond": {
+			duration: time.Millisecond,
+			expected: "1ms",
+		},
+		"fractional millisecond": {
+			duration: time.Millisecond + 500*time.Microsecond,
+			expected: "1.5ms",
+		},
+		"seconds use milliseconds": {
+			duration: 59 * time.Second,
+			expected: "59000ms",
+		},
+		"minutes use milliseconds": {
+			duration: 2 * time.Minute,
+			expected: "120000ms",
+		},
+		"hours use milliseconds": {
+			duration: time.Hour,
+			expected: "3600000ms",
+		},
+		"trailing zeroes are removed": {
+			duration: time.Millisecond + 100*time.Nanosecond,
+			expected: "1.0001ms",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, test.expected, formatNexusTimeout(test.duration))
+		})
+	}
+}
+
+func TestNormalizeNexusTimeoutHeaders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no timeout headers", func(t *testing.T) {
+		headers := nexus.Header{"X-Trace-ID": "trace-1"}
+		assert.Equal(t, headers, normalizeNexusTimeoutHeaders(context.Background(), headers))
+	})
+
+	t.Run("actual request deadline and operation budget become decimal milliseconds", func(t *testing.T) {
+		now := time.Now()
+		ctx, cancel := context.WithDeadline(context.Background(), now.Add(123_456_789*time.Nanosecond))
+		defer cancel()
+		headers := nexus.Header{
+			"request-timeout":   "1h",
+			"Request-Timeout":   "2h",
+			"operation-timeout": "1h",
+			"OPERATION-TIMEOUT": "999.999µs",
+			"X-Trace-ID":        "trace-1",
+		}
+		original := maps.Clone(headers)
+
+		assert.Equal(t, nexus.Header{
+			"Request-Timeout":   "123.456789ms",
+			"Operation-Timeout": "0.999999ms",
+			"X-Trace-ID":        "trace-1",
+		}, normalizeNexusTimeoutHeadersAt(ctx, headers, now))
+		assert.Equal(t, original, headers, "normalization must not mutate SDK-owned headers")
+	})
+
+	t.Run("expired and malformed budgets fail closed", func(t *testing.T) {
+		now := time.Now()
+		ctx, cancel := context.WithDeadline(context.Background(), now.Add(-time.Nanosecond))
+		defer cancel()
+		headers := nexus.Header{
+			"request-timeout":   "not-a-duration",
+			"Request-Timeout":   "1h",
+			"operation-timeout": "-33.542µs",
+		}
+
+		assert.Equal(t, nexus.Header{
+			"Request-Timeout":   "0ms",
+			"Operation-Timeout": "0ms",
+		}, normalizeNexusTimeoutHeadersAt(ctx, headers, now))
+	})
+}
+
+func TestStartOperation_NormalizesTimeoutHeaders(t *testing.T) {
+	codec := &mockCodec{encodeErr: errors.New("stop after encode")}
+	handler := NewNexusHandler(codec, nil, zap.NewNop(), "default")
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	headers := nexus.Header{
+		"Request-Timeout":   "1h",
+		"request-timeout":   "2h",
+		"operation-timeout": "-1ns",
+		"X-Trace-ID":        "trace-1",
+	}
+	original := maps.Clone(headers)
+
+	_, _ = handler.startOperation(
+		ctx,
+		"tq",
+		"MyService",
+		"myOp",
+		nil,
+		nexus.StartOperationOptions{Header: headers},
+	)
+
+	require.NotNil(t, codec.encodedMsg)
+	cmd, ok := codec.encodedMsg.Command.(internal.InvokeNexusOperation)
+	require.True(t, ok)
+	assert.Equal(t, map[string]string{
+		"Request-Timeout":   "0ms",
+		"Operation-Timeout": "0ms",
+		"X-Trace-ID":        "trace-1",
+	}, cmd.Headers)
+	assert.Equal(t, original, headers, "encoding must not mutate SDK-owned headers")
+}
+
 func TestStartOperation_EncodesPayload(t *testing.T) {
 	codec := &mockCodec{
 		encodeErr: errors.New("stop after encode"),
@@ -432,6 +569,37 @@ func TestCancelOperation_ExtractsHeaders(t *testing.T) {
 
 	assert.Equal(t, "trace-1", cmd.Headers["X-Nexus-Trace-Id"])
 	assert.Equal(t, "Bearer xyz", cmd.Headers["Authorization"])
+}
+
+func TestCancelOperation_NormalizesTimeoutHeaders(t *testing.T) {
+	codec := &mockCodec{encodeErr: errors.New("stop")}
+	handler := NewNexusHandler(codec, nil, zap.NewNop(), "default")
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	headers := nexus.Header{
+		"request-timeout": "750µs",
+		"REQUEST-TIMEOUT": "1h",
+		"X-Trace-ID":      "trace-1",
+	}
+	original := maps.Clone(headers)
+
+	_ = handler.cancelOperation(
+		ctx,
+		"tq",
+		"GreetingService",
+		"greet",
+		"async-token-123",
+		nexus.CancelOperationOptions{Header: headers},
+	)
+
+	require.NotNil(t, codec.encodedMsg)
+	cmd, ok := codec.encodedMsg.Command.(internal.CancelNexusOperation)
+	require.True(t, ok)
+	assert.Equal(t, map[string]string{
+		"Request-Timeout": "0ms",
+		"X-Trace-ID":      "trace-1",
+	}, cmd.Headers)
+	assert.Equal(t, original, headers, "encoding must not mutate SDK-owned headers")
 }
 
 // TestStartOperation_EncodesNamespace verifies the handler's configured
