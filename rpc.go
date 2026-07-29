@@ -47,7 +47,7 @@ type RecordHeartbeatResponse struct {
 	Paused   bool `json:"paused"`
 }
 
-// NexusMethodCancellationRequest identifies an in-flight handler Start call.
+// NexusMethodCancellationRequest identifies an in-flight handler method call.
 type NexusMethodCancellationRequest struct {
 	InvocationID uint64 `json:"invocationId"`
 }
@@ -139,8 +139,8 @@ func (r *rpc) GetNexusServiceNames(_ bool, out *[]string) error {
 	return nil
 }
 
-// GetNexusMethodCancellation lets the PHP process executing a Nexus Start
-// cooperatively poll its Go handler context. This uses RoadRunner's independent
+// GetNexusMethodCancellation lets the PHP process executing a Nexus handler
+// method cooperatively poll its Go context. This uses RoadRunner's independent
 // RPC transport; it must not be routed through the single-request PHP pool.
 func (r *rpc) GetNexusMethodCancellation(in NexusMethodCancellationRequest, out *NexusMethodCancellationResponse) error {
 	registry := r.plugin.temporal.nexusMethodCancellations

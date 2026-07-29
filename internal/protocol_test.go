@@ -383,13 +383,32 @@ func TestCancelNexusOperation_MarshalsHeaders(t *testing.T) {
 		Headers:        map[string]string{"x-nexus-trace-id": "trace-1"},
 	})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"service":"s","operation":"o","operationToken":"tok","headers":{"x-nexus-trace-id":"trace-1"}}`, string(out))
+	assert.JSONEq(t, `{"service":"s","operation":"o","operationToken":"tok","headers":{"x-nexus-trace-id":"trace-1"},"invocationId":0}`, string(out))
 }
 
 func TestCancelNexusOperation_OmitsEmptyHeaders(t *testing.T) {
 	out, err := json.Marshal(CancelNexusOperation{Service: "s", Operation: "o", OperationToken: "tok"})
 	require.NoError(t, err)
 	assert.NotContains(t, string(out), "headers")
+}
+
+func TestNexusHandlerCommands_MarshalInvocationID(t *testing.T) {
+	start, err := json.Marshal(InvokeNexusOperation{
+		Service:      "s",
+		Operation:    "o",
+		InvocationID: 17,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(start), `"invocationId":17`)
+
+	cancel, err := json.Marshal(CancelNexusOperation{
+		Service:        "s",
+		Operation:      "o",
+		OperationToken: "tok",
+		InvocationID:   23,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(cancel), `"invocationId":23`)
 }
 
 // Namespace marshals when set, omitted when empty (PHP reads $options['namespace']).

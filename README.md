@@ -25,21 +25,22 @@ Nexus endpoint, request and callback headers, links, payloads, operation
 tokens, and handler failures are preserved across the bridge.
 
 Handler-method cancellation is cooperative. RoadRunner records cancellation of
-an in-flight Nexus `Start` context in a process-independent registry. The PHP
-SDK polls that state over RoadRunner's local RPC connection while the handler
-is running. A cancellation is sticky until `Start` returns and the entry is
-then removed. This design is intentional: PHP pool workers process one request
-at a time, so a second pool request would queue behind `Start` with one worker
-or could land in the wrong process with multiple workers.
+in-flight Nexus `Start` and `Cancel` contexts in a process-independent
+registry. The PHP SDK polls that state over RoadRunner's local RPC connection
+while the handler is running. A cancellation is sticky until the handler
+method returns and the entry is then removed. This design is intentional: PHP
+pool workers process one request at a time, so a second pool request would
+queue behind the active handler with one worker or could land in the wrong
+process with multiple workers.
 
-The PHP `Start` dispatch is detached from the Nexus request context so that the
-request cancellation signal cannot abort or kill the worker before PHP polls
-it. RoadRunner's activity-pool `allocate_timeout` still bounds worker
-allocation, and `supervisor.exec_ttl` is the hard execution bound when
-configured. Production deployments should configure `supervisor.exec_ttl`
-longer than the handler's expected cooperative cleanup interval; without a
-supervisor TTL, a handler that never returns can occupy a PHP worker
-indefinitely, as with any other unsupervised RoadRunner pool job.
+The PHP `Start` and `Cancel` dispatches are detached from their Nexus request
+contexts so that the request cancellation signal cannot abort or kill the
+worker before PHP polls it. RoadRunner's activity-pool `allocate_timeout` still
+bounds worker allocation, and `supervisor.exec_ttl` is the hard execution bound
+when configured. Production deployments should configure
+`supervisor.exec_ttl` longer than the handler's expected cooperative cleanup
+interval; without a supervisor TTL, a handler that never returns can occupy a
+PHP worker indefinitely, as with any other unsupervised RoadRunner pool job.
 
 PHP handlers doing long work must inspect their operation context for method
 cancellation at appropriate cooperative cancellation points. This is separate

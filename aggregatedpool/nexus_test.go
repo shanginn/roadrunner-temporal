@@ -399,6 +399,7 @@ func TestCancelOperation_EncodesAllFields(t *testing.T) {
 	assert.Equal(t, "tq", cmd.TaskQueue)
 	assert.Equal(t, "orders-endpoint", cmd.Endpoint)
 	assert.Equal(t, "async-token-123", cmd.OperationToken)
+	assert.NotZero(t, cmd.InvocationID)
 }
 
 // TestCancelOperation_ExtractsHeaders verifies the caller's cancel-request
@@ -587,8 +588,8 @@ func TestStartOperation_ConcurrentSeqIDIncrement(t *testing.T) {
 
 // ── Method cancellation tests ──────────────────────────────────
 
-// InvocationID is the correlation key CancelNexusOperationMethod uses to find
-// the in-flight handler; PHP correlates via this field only.
+// InvocationID is the correlation key PHP uses to poll RoadRunner's
+// process-independent method-cancellation registry.
 func TestStartOperation_SetsInvocationID(t *testing.T) {
 	codec := &mockCodec{encodeErr: errors.New("stop")}
 	handler := NewNexusHandler(codec, nil, zap.NewNop(), "default")
@@ -600,6 +601,21 @@ func TestStartOperation_SetsInvocationID(t *testing.T) {
 
 	require.NotNil(t, codec.encodedMsg)
 	cmd, ok := codec.encodedMsg.Command.(internal.InvokeNexusOperation)
+	require.True(t, ok)
+	assert.NotZero(t, cmd.InvocationID)
+}
+
+func TestCancelOperation_SetsInvocationID(t *testing.T) {
+	codec := &mockCodec{encodeErr: errors.New("stop")}
+	handler := NewNexusHandler(codec, nil, zap.NewNop(), "default")
+
+	_ = handler.cancelOperation(
+		context.Background(), "tq", "S", "op",
+		"token", nexus.CancelOperationOptions{},
+	)
+
+	require.NotNil(t, codec.encodedMsg)
+	cmd, ok := codec.encodedMsg.Command.(internal.CancelNexusOperation)
 	require.True(t, ok)
 	assert.NotZero(t, cmd.InvocationID)
 }
@@ -675,8 +691,9 @@ func TestStartOperation_CtxCancelAfterCompletionNoop(t *testing.T) {
 }
 
 // blockingPool models both failure modes of the old second-Exec design:
-// with one PHP worker it queues behind Start; with more workers it is free to
-// select a different process whose PHP-local registry cannot know the ID.
+// with one PHP worker it queues behind the active handler; with more workers
+// it is free to select a different process whose PHP-local registry cannot
+// know the ID.
 type blockingPool struct {
 	execCalls   int32
 	started     chan struct{}
@@ -700,7 +717,7 @@ func (p *blockingPool) Exec(ctx context.Context, _ *payload.Payload, _ chan stru
 		p.execContext <- ctx
 		close(p.started)
 		<-p.release
-		return nil, errors.New("release blocked Start")
+		return nil, errors.New("release blocked handler")
 	}
 
 	select {
@@ -758,6 +775,48 @@ func TestStartOperation_ContextCancelNeverDispatchesSecondPoolRequest(t *testing
 
 	_, found := registry.Lookup(cmd.InvocationID)
 	assert.False(t, found, "Start completion must discard registry state")
+}
+
+func TestCancelOperation_ContextCancelMarksRegistryAndKeepsPoolDispatchAlive(t *testing.T) {
+	codec := &mockCodec{}
+	pool := newBlockingPool()
+	registry := new(NexusMethodCancellationRegistry)
+	handler := NewNexusHandlerWithCancellationRegistry(codec, pool, zap.NewNop(), "default", registry)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- handler.cancelOperation(ctx, "tq", "S", "o", "token", nexus.CancelOperationOptions{})
+	}()
+
+	<-pool.started
+	execCtx := <-pool.execContext
+	cmd, ok := codec.encodedMsg.Command.(internal.CancelNexusOperation)
+	require.True(t, ok)
+	cancel()
+
+	assert.NoError(t, execCtx.Err(), "method cancellation must not cancel the PHP pool dispatch")
+	assert.Nil(t, execCtx.Done(), "Cancel must use a detached pool context")
+	_, hasDeadline := execCtx.Deadline()
+	assert.False(t, hasDeadline, "the pool owns allocation and execution hard limits")
+
+	require.Eventually(t, func() bool {
+		state, found := registry.Lookup(cmd.InvocationID)
+		return found && state.Cancelled
+	}, time.Second, time.Millisecond)
+
+	select {
+	case <-pool.secondExec:
+		t.Fatal("context cancellation dispatched a second, non-process-affine pool request")
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.EqualValues(t, 1, atomic.LoadInt32(&pool.execCalls))
+
+	close(pool.release)
+	require.Error(t, <-result)
+
+	_, found := registry.Lookup(cmd.InvocationID)
+	assert.False(t, found, "Cancel completion must discard registry state")
 }
 
 // ── Failure → Nexus error mapping ──────────────────────────────────

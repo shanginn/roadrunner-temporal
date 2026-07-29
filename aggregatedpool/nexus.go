@@ -381,6 +381,7 @@ func (h *NexusHandler) cancelOperation(
 ) error {
 	h.log.Debug("nexus cancel operation", zap.String("service", serviceName), zap.String("operation", operationName), zap.Bool("operation_token_present", token != ""), zap.String(tq, taskQueue))
 
+	invocationID := h.cancellations.RegisterNew()
 	msg := &internal.Message{
 		ID: atomic.AddUint64(&h.seqID, 1),
 		Command: internal.CancelNexusOperation{
@@ -391,10 +392,21 @@ func (h *NexusHandler) cancelOperation(
 			Endpoint:       h.endpoint(ctx),
 			OperationToken: token,
 			Headers:        maps.Clone(options.Header),
+			InvocationID:   invocationID,
 		},
 	}
 
-	r, err := h.roundTrip(ctx, taskQueue, msg, "nexus cancel request")
+	done := make(chan struct{})
+	defer func() {
+		h.cancellations.Discard(invocationID)
+		close(done)
+	}()
+	go h.watchForMethodCancel(ctx, invocationID, done)
+
+	// Cancel handlers receive the same cooperative method-cancellation contract
+	// as Start handlers. Keep the PHP request alive after the original Nexus
+	// context is cancelled so it can poll and finish its bounded cleanup.
+	r, err := h.roundTrip(context.WithoutCancel(ctx), taskQueue, msg, "nexus cancel request")
 	if err != nil {
 		return err
 	}
@@ -451,7 +463,7 @@ func (h *NexusHandler) newNexusHandlerError(typ nexus.HandlerErrorType, retry ne
 
 // watchForMethodCancel records cancellation in a process-independent registry.
 // PHP checks the registry via the temporal RPC plugin, so no pool request can
-// queue behind Start or land on a different PHP process.
+// queue behind the current Start/Cancel call or land on a different PHP process.
 func (h *NexusHandler) watchForMethodCancel(ctx context.Context, invocationID uint64, done <-chan struct{}) {
 	select {
 	case <-ctx.Done():

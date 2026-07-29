@@ -78,7 +78,7 @@ func (r *NexusMethodCancellationRegistry) Lookup(invocationID uint64) (NexusMeth
 	return state, ok
 }
 
-// Discard removes an invocation after its PHP Start request has returned.
+// Discard removes an invocation after its PHP handler request has returned.
 func (r *NexusMethodCancellationRegistry) Discard(invocationID uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

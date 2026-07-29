@@ -388,14 +388,15 @@ type InvokeNexusOperation struct {
 	CallbackHeaders map[string]string `json:"callbackHeaders,omitempty"`
 	Headers         map[string]string `json:"headers,omitempty"`
 	Links           []NexusLink       `json:"links,omitempty"`
-	// InvocationID correlates with CancelNexusOperationMethod.
+	// InvocationID correlates this handler method with cooperative cancellation.
 	InvocationID uint64 `json:"invocationId"`
 }
 
 // CancelNexusOperationMethod cooperatively stops an in-flight handler method
-// (distinct from CancelNexusOperation, which targets the business operation).
+// through the legacy process-local route. New workers poll RoadRunner's
+// process-independent registry instead.
 type CancelNexusOperationMethod struct {
-	InvocationID uint64 `json:"invocationId"` // matches InvokeNexusOperation.InvocationID
+	InvocationID uint64 `json:"invocationId"`
 	Reason       string `json:"reason,omitempty"`
 }
 
@@ -409,7 +410,8 @@ type CancelNexusOperation struct {
 	OperationToken string `json:"operationToken"`
 	// Raw HTTP-style headers from the caller's cancel request, propagated to the
 	// handler's OperationContext. Symmetric with ExecuteNexusOperation.NexusHeaders.
-	Headers map[string]string `json:"headers,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	InvocationID uint64            `json:"invocationId"`
 }
 
 // NexusOperationStarted: PHP→Go reply to InvokeNexusOperation success.
