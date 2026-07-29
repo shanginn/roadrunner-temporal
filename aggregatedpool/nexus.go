@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/roadrunner-server/goridge/v3/pkg/frame"
 	"github.com/roadrunner-server/pool/payload"
@@ -19,6 +18,7 @@ import (
 	failurepb "go.temporal.io/api/failure/v1"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/temporalnexus"
 	"go.uber.org/zap"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -27,8 +27,10 @@ import (
 // Wire contract with PHP — must match FailureConverter::NEXUS_OPERATION_ERROR_TYPE_PREFIX.
 const nexusOperationErrorTypePrefix = "nexus.OperationError."
 
-// Timeout for the fire-and-forget CancelNexusOperationMethod RPC.
-const nexusCancelMethodTimeout = 5 * time.Second
+const (
+	nexusInternalHandlerErrorMessage    = "internal Nexus handler error"
+	nexusUnavailableHandlerErrorMessage = "Nexus handler unavailable"
+)
 
 // NexusHandler forwards handler-side Nexus Start/Cancel to PHP via the activity pool.
 type NexusHandler struct {
@@ -36,23 +38,48 @@ type NexusHandler struct {
 	pool      api.Pool
 	log       *zap.Logger
 	namespace string
-	// seqID is the wire envelope ID; invocationSeq is the InvocationID seen by
-	// PHP and used by CancelNexusOperationMethod. Kept separate so wire format
-	// can evolve without touching cooperative-cancel semantics.
+	endpoint  func(context.Context) string
+	// seqID is the wire envelope ID. Invocation IDs are allocated by the shared
+	// cancellation registry so plugin resets cannot reuse an ID while an old
+	// watcher is still exiting.
 	seqID         uint64
-	invocationSeq uint64
 	pldPool       *sync.Pool
-	// inFlight gates CancelNexusOperationMethod emission so we don't race a
-	// cancel past Start completion.
-	inFlight sync.Map
+	cancellations *NexusMethodCancellationRegistry
 }
 
 func NewNexusHandler(codec api.Codec, pool api.Pool, log *zap.Logger, namespace string) *NexusHandler {
+	return NewNexusHandlerWithCancellationRegistry(
+		codec,
+		pool,
+		log,
+		namespace,
+		new(NexusMethodCancellationRegistry),
+	)
+}
+
+// NewNexusHandlerWithCancellationRegistry creates a Nexus handler whose
+// invocation-cancellation state can be queried through RoadRunner's local RPC
+// service. The registry is deliberately outside the PHP worker pool: a pool
+// Exec cannot target the process already executing Start, and a one-worker pool
+// cannot receive another Exec until Start returns.
+func NewNexusHandlerWithCancellationRegistry(
+	codec api.Codec,
+	pool api.Pool,
+	log *zap.Logger,
+	namespace string,
+	cancellations *NexusMethodCancellationRegistry,
+) *NexusHandler {
+	if cancellations == nil {
+		cancellations = new(NexusMethodCancellationRegistry)
+	}
+
 	return &NexusHandler{
-		codec:     codec,
-		pool:      pool,
-		log:       log,
-		namespace: namespace,
+		codec:         codec,
+		pool:          pool,
+		log:           log,
+		namespace:     namespace,
+		endpoint:      nexusEndpoint,
+		cancellations: cancellations,
 		pldPool: &sync.Pool{
 			New: func() any {
 				return new(payload.Payload)
@@ -79,6 +106,14 @@ func (op *nexusOperation) Start(ctx context.Context, input converter.RawValue, o
 
 func (op *nexusOperation) Cancel(ctx context.Context, token string, options nexus.CancelOperationOptions) error {
 	return op.handler.cancelOperation(ctx, op.taskQueue, op.serviceName, op.name, token, options)
+}
+
+func nexusEndpoint(ctx context.Context) string {
+	if !temporalnexus.IsNexusOperation(ctx) {
+		return ""
+	}
+
+	return temporalnexus.GetOperationInfo(ctx).Endpoint
 }
 
 // CreateNexusService builds a nexus.Service with pass-through operations.
@@ -109,7 +144,7 @@ func (h *NexusHandler) startOperation(
 
 	links := nexusLinksToInternal(options.Links)
 
-	invocationID := atomic.AddUint64(&h.invocationSeq, 1)
+	invocationID := h.cancellations.RegisterNew()
 	msg := &internal.Message{
 		ID: atomic.AddUint64(&h.seqID, 1),
 		Command: internal.InvokeNexusOperation{
@@ -117,6 +152,7 @@ func (h *NexusHandler) startOperation(
 			Operation:       operationName,
 			Namespace:       h.namespace,
 			TaskQueue:       taskQueue,
+			Endpoint:        h.endpoint(ctx),
 			RequestID:       options.RequestID,
 			Callback:        options.CallbackURL,
 			CallbackHeaders: maps.Clone(options.CallbackHeader),
@@ -130,28 +166,34 @@ func (h *NexusHandler) startOperation(
 		msg.Payloads = &commonpb.Payloads{Payloads: []*commonpb.Payload{input}}
 	}
 
-	// Watch ctx cancellation during Start; emit method cancel to PHP. The inFlight-before-done
-	// ordering only shrinks the stale-observe window; a stale cancel is harmless (best-effort).
-	h.inFlight.Store(invocationID, struct{}{})
+	// PHP workers are single-request processes and the RoadRunner pool does not
+	// expose process-affine dispatch. Store method cancellation in the Go plugin
+	// instead; PHP polls it through the independent local RPC transport.
 	done := make(chan struct{})
 	defer func() {
-		h.inFlight.Delete(invocationID)
+		h.cancellations.Discard(invocationID)
 		close(done)
 	}()
 	go h.watchForMethodCancel(ctx, invocationID, done)
 
-	r, err := h.roundTrip(ctx, taskQueue, msg, "nexus request")
+	// RoadRunner may derive worker allocation and supervisor contexts from the
+	// context passed to Pool.Exec. The Nexus method context is intentionally
+	// watched above, but must not terminate the PHP process: the PHP handler
+	// needs to remain alive long enough to poll and cooperatively observe that
+	// cancellation. WithoutCancel preserves request-scoped values while leaving
+	// allocation_timeout and supervisor.exec_ttl as the pool's hard bounds.
+	r, err := h.roundTrip(context.WithoutCancel(ctx), taskQueue, msg, "nexus request")
 	if err != nil {
 		return nil, err
 	}
 
 	out := make([]*internal.Message, 0, 1)
 	if err := h.codec.Decode(r, &out); err != nil {
-		return nil, newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "decode nexus response", err)
+		return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "decode nexus response", err)
 	}
 
 	if len(out) != 1 {
-		return nil, newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "invalid nexus worker response", nil)
+		return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "invalid nexus worker response", nil)
 	}
 
 	return h.decodeStartReply(ctx, out[0])
@@ -167,32 +209,32 @@ func (h *NexusHandler) roundTrip(ctx context.Context, taskQueue string, msg *int
 	if err := h.codec.Encode(&internal.Context{TaskQueue: taskQueue}, pl, msg); err != nil {
 		// Encoding our own request is a deterministic local bug, not a transient
 		// fault — don't ask the server to retry it.
-		return nil, newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "encode "+what, err)
+		return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "encode "+what, err)
 	}
 
 	ch := make(chan struct{}, 1)
 	result, err := h.pool.Exec(ctx, pl, ch)
 	if err != nil {
 		// Pool returned before queueing — typically pool busy / exec rejected; retryable.
-		return nil, newNexusHandlerError(nexus.HandlerErrorTypeUnavailable, nexus.HandlerErrorRetryBehaviorRetryable, "exec "+what, err)
+		return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeUnavailable, nexus.HandlerErrorRetryBehaviorRetryable, "exec "+what, err)
 	}
 
 	select {
 	case pld := <-result:
 		if pld.Error() != nil {
 			// Worker-side execution failure: retryable per Nexus spec for INTERNAL.
-			return nil, newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorUnspecified, "nexus worker exec error", pld.Error())
+			return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorUnspecified, "nexus worker exec error", pld.Error())
 		}
 		if pld.Payload().Flags&frame.STREAM != 0 {
 			ch <- struct{}{}
 			// Streaming worker replies violate the protocol; server-side fault.
-			return nil, newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "streaming is not supported", nil)
+			return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "streaming is not supported", nil)
 		}
 		return pld.Payload(), nil
 	default:
 		// Pool returned a result channel without a value — should not happen on a
 		// healthy pool. Treat as transient.
-		return nil, newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorRetryable, "nexus worker empty response", nil)
+		return nil, h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorRetryable, "nexus worker empty response", nil)
 	}
 }
 
@@ -216,14 +258,14 @@ func (h *NexusHandler) decodeStartReply(ctx context.Context, retMsg *internal.Me
 		}, nil
 	case nil:
 		if retMsg.Failure != nil {
-			return nil, nexusErrorFromFailure(retMsg.Failure)
+			return nil, h.nexusErrorFromFailure(retMsg.Failure)
 		}
-		return nil, newNexusHandlerError(
+		return nil, h.newNexusHandlerError(
 			nexus.HandlerErrorTypeInternal,
 			nexus.HandlerErrorRetryBehaviorNonRetryable,
 			"nexus worker reply has neither command nor failure", nil)
 	default:
-		return nil, newNexusHandlerError(
+		return nil, h.newNexusHandlerError(
 			nexus.HandlerErrorTypeInternal,
 			nexus.HandlerErrorRetryBehaviorNonRetryable,
 			fmt.Sprintf("unexpected nexus reply command %T", retMsg.Command), nil)
@@ -277,14 +319,19 @@ func forwardNexusLinks(ctx context.Context, links []internal.NexusLink, log *zap
 
 // Cause holds the original proto via failureHolder so SDK-Go's ErrorToFailure
 // round-trips it back without losing structure (same contract as activity.go).
-func nexusErrorFromFailure(f *failurepb.Failure) error {
+func (h *NexusHandler) nexusErrorFromFailure(f *failurepb.Failure) error {
 	cause := temporal.GetDefaultFailureConverter().FailureToError(f)
 
 	if nhf := f.GetNexusHandlerFailureInfo(); nhf != nil {
+		typ := nexus.HandlerErrorType(nhf.GetType())
+		retry := mapNexusRetryBehavior(nhf.GetRetryBehavior())
+		if typ == nexus.HandlerErrorTypeInternal || typ == nexus.HandlerErrorTypeUnavailable {
+			return h.newNexusHandlerError(typ, retry, "PHP Nexus handler failure: "+f.GetMessage(), cause)
+		}
 		return &nexus.HandlerError{
-			Type:          nexus.HandlerErrorType(nhf.GetType()),
+			Type:          typ,
 			Message:       f.GetMessage(),
-			RetryBehavior: mapNexusRetryBehavior(nhf.GetRetryBehavior()),
+			RetryBehavior: retry,
 			Cause:         cause,
 		}
 	}
@@ -305,11 +352,12 @@ func nexusErrorFromFailure(f *failurepb.Failure) error {
 		}
 	}
 
-	return &nexus.HandlerError{
-		Type:    nexus.HandlerErrorTypeInternal,
-		Message: f.GetMessage(),
-		Cause:   cause,
-	}
+	return h.newNexusHandlerError(
+		nexus.HandlerErrorTypeInternal,
+		nexus.HandlerErrorRetryBehaviorUnspecified,
+		"unrecognized PHP Nexus failure: "+f.GetMessage(),
+		cause,
+	)
 }
 
 func mapNexusRetryBehavior(b enumspb.NexusHandlerErrorRetryBehavior) nexus.HandlerErrorRetryBehavior {
@@ -331,7 +379,7 @@ func (h *NexusHandler) cancelOperation(
 	token string,
 	options nexus.CancelOperationOptions,
 ) error {
-	h.log.Debug("nexus cancel operation", zap.String("service", serviceName), zap.String("operation", operationName), zap.String("token", token), zap.String(tq, taskQueue))
+	h.log.Debug("nexus cancel operation", zap.String("service", serviceName), zap.String("operation", operationName), zap.Bool("operation_token_present", token != ""), zap.String(tq, taskQueue))
 
 	msg := &internal.Message{
 		ID: atomic.AddUint64(&h.seqID, 1),
@@ -340,6 +388,7 @@ func (h *NexusHandler) cancelOperation(
 			Operation:      operationName,
 			Namespace:      h.namespace,
 			TaskQueue:      taskQueue,
+			Endpoint:       h.endpoint(ctx),
 			OperationToken: token,
 			Headers:        maps.Clone(options.Header),
 		},
@@ -359,85 +408,59 @@ func (h *NexusHandler) cancelOperation(
 func (h *NexusHandler) decodeCancelReply(r *payload.Payload) error {
 	out := make([]*internal.Message, 0, 1)
 	if err := h.codec.Decode(r, &out); err != nil {
-		return newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "decode nexus cancel response", err)
+		return h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "decode nexus cancel response", err)
 	}
 
 	if len(out) != 1 {
-		return newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "invalid nexus worker cancel response", nil)
+		return h.newNexusHandlerError(nexus.HandlerErrorTypeInternal, nexus.HandlerErrorRetryBehaviorNonRetryable, "invalid nexus worker cancel response", nil)
 	}
 
 	if out[0].Failure != nil {
-		return nexusErrorFromFailure(out[0].Failure)
+		return h.nexusErrorFromFailure(out[0].Failure)
 	}
 
 	return nil
 }
 
-// newNexusHandlerError constructs a *nexus.HandlerError with explicit type and
-// retry behavior. cause may be nil. The cause string is appended to Message so
-// it surfaces via Error() (HandlerError.Error() doesn't print Cause), while the
-// original error is preserved for errors.Unwrap / errors.Is.
-func newNexusHandlerError(typ nexus.HandlerErrorType, retry nexus.HandlerErrorRetryBehavior, message string, cause error) *nexus.HandlerError {
-	full := message
-	if cause != nil {
-		full = message + ": " + cause.Error()
+// newNexusHandlerError records the actionable detail locally and returns a
+// stable external message. Internal causes may contain PHP paths, payload
+// fragments, transport addresses, or credentials and must not cross the Nexus
+// boundary.
+func (h *NexusHandler) newNexusHandlerError(typ nexus.HandlerErrorType, retry nexus.HandlerErrorRetryBehavior, detail string, cause error) *nexus.HandlerError {
+	fields := []zap.Field{
+		zap.String("type", string(typ)),
+		zap.Int("retry_behavior", int(retry)),
+		zap.String("detail", detail),
 	}
+	if cause != nil {
+		fields = append(fields, zap.NamedError("cause", cause))
+	}
+	h.log.Error("nexus handler request failed", fields...)
+
+	message := nexusInternalHandlerErrorMessage
+	if typ == nexus.HandlerErrorTypeUnavailable {
+		message = nexusUnavailableHandlerErrorMessage
+	}
+
 	return &nexus.HandlerError{
 		Type:          typ,
-		Message:       full,
+		Message:       message,
 		RetryBehavior: retry,
-		Cause:         cause,
 	}
 }
 
-// watchForMethodCancel: one goroutine per in-flight invocation; emits cancel on ctx.Done.
+// watchForMethodCancel records cancellation in a process-independent registry.
+// PHP checks the registry via the temporal RPC plugin, so no pool request can
+// queue behind Start or land on a different PHP process.
 func (h *NexusHandler) watchForMethodCancel(ctx context.Context, invocationID uint64, done <-chan struct{}) {
 	select {
 	case <-ctx.Done():
-		if _, ok := h.inFlight.Load(invocationID); !ok {
-			return
+		reason := "Nexus handler context cancelled"
+		if cause := context.Cause(ctx); cause != nil {
+			reason = cause.Error()
 		}
-		h.sendCancelMethod(invocationID, ctx.Err().Error())
+		h.cancellations.Cancel(invocationID, reason)
 	case <-done:
-	}
-}
-
-// sendCancelMethod is fire-and-forget; failures are logged and swallowed.
-func (h *NexusHandler) sendCancelMethod(invocationID uint64, reason string) {
-	msg := &internal.Message{
-		ID: atomic.AddUint64(&h.seqID, 1),
-		Command: internal.CancelNexusOperationMethod{
-			InvocationID: invocationID,
-			Reason:       reason,
-		},
-	}
-
-	pl := h.getPld()
-	defer h.putPld(pl)
-
-	if err := h.codec.Encode(&internal.Context{}, pl, msg); err != nil {
-		h.log.Warn("nexus cancel method encode failed", zap.Uint64("invocationID", invocationID), zap.Error(err))
-		return
-	}
-
-	// Original ctx is already cancelled; use a fresh one with timeout so we don't
-	// hang forever if the pool is shutting down.
-	ctx, cancel := context.WithTimeout(context.Background(), nexusCancelMethodTimeout)
-	defer cancel()
-	ch := make(chan struct{}, 1)
-	result, err := h.pool.Exec(ctx, pl, ch)
-	if err != nil {
-		h.log.Warn("nexus cancel method exec failed", zap.Uint64("invocationID", invocationID), zap.Error(err))
-		return
-	}
-
-	select {
-	case pld := <-result:
-		if pld != nil && pld.Error() != nil {
-			h.log.Warn("nexus method cancel delivery failed", zap.Uint64("invocationID", invocationID), zap.Error(pld.Error()))
-		}
-	case <-ctx.Done():
-		h.log.Warn("nexus method cancel delivery failed", zap.Uint64("invocationID", invocationID), zap.Error(ctx.Err()))
 	}
 }
 

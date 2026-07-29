@@ -52,16 +52,17 @@ type Logger interface {
 
 // temporal structure contains temporal specific structures
 type temporal struct {
-	rrActivityDef *aggregatedpool.Activity
-	rrWorkflowDef *aggregatedpool.Workflow
-	workflows     map[string]*internal.WorkflowInfo
-	activities    map[string]*internal.ActivityInfo
-	nexusServices map[string]*internal.NexusServiceInfo
-	mh            tclient.MetricsHandler
-	tallyCloser   io.Closer
-	tlsCfg        *tls.Config
-	client        tclient.Client
-	workers       []worker.Worker
+	rrActivityDef            *aggregatedpool.Activity
+	rrWorkflowDef            *aggregatedpool.Workflow
+	workflows                map[string]*internal.WorkflowInfo
+	activities               map[string]*internal.ActivityInfo
+	nexusServices            map[string]*internal.NexusServiceInfo
+	nexusMethodCancellations *aggregatedpool.NexusMethodCancellationRegistry
+	mh                       tclient.MetricsHandler
+	tallyCloser              io.Closer
+	tlsCfg                   *tls.Config
+	client                   tclient.Client
+	workers                  []worker.Worker
 
 	interceptors   map[string]api.Interceptor
 	dataConverters map[string]converter.PayloadConverter
@@ -131,7 +132,9 @@ func (p *Plugin) Init(cfg api.Configurer, log Logger, server api.Server) error {
 		return errors.E(op, err)
 	}
 	// init temporal section
-	p.temporal = &temporal{}
+	p.temporal = &temporal{
+		nexusMethodCancellations: new(aggregatedpool.NexusMethodCancellationRegistry),
+	}
 	// CONFIG INIT END -----
 
 	p.log = log.NamedLogger(pluginName)
@@ -350,6 +353,7 @@ func (p *Plugin) Reset() error {
 		return errors.E(op, errAp)
 	}
 	p.log.Info("activity pool restarted")
+	p.temporal.nexusMethodCancellations.Reset()
 
 	// get worker info
 	wi, err := WorkerInfo(p.codec, p.wfP, p.rrVersion, p.wwPID)
@@ -361,7 +365,13 @@ func (p *Plugin) Reset() error {
 	workers, err := aggregatedpool.TemporalWorkers(
 		p.temporal.rrWorkflowDef,
 		p.temporal.rrActivityDef,
-		aggregatedpool.NewNexusHandler(p.codec, p.actP, p.log, p.config.Namespace),
+		aggregatedpool.NewNexusHandlerWithCancellationRegistry(
+			p.codec,
+			p.actP,
+			p.log,
+			p.config.Namespace,
+			p.temporal.nexusMethodCancellations,
+		),
 		wi,
 		p.log,
 		p.temporal.client,

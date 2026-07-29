@@ -95,3 +95,13 @@ func NexusServicesInfo(wi []*internal.WorkerInfo) map[string]*internal.NexusServ
 
 	return nexusInfo
 }
+
+func HasNexusServices(wi []*internal.WorkerInfo) bool {
+	for i := range wi {
+		if len(wi[i].NexusServices) > 0 {
+			return true
+		}
+	}
+
+	return false
+}

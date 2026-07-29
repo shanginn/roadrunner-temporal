@@ -6,9 +6,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/temporalio/roadrunner-temporal/v5/api"
+	"github.com/temporalio/roadrunner-temporal/v5/internal"
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/sdk/converter"
 	sdkinterceptor "go.temporal.io/sdk/interceptor"
+	"go.uber.org/zap"
+
+	"github.com/nexus-rpc/sdk-go/nexus"
 )
 
 // mockPayloadConverter implements converter.PayloadConverter for testing.
@@ -294,6 +298,30 @@ func TestRegisterNexusService_DuplicateOperation_ReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "billing", "should name the offending service")
 	assert.Contains(t, err.Error(), "my-task-queue", "should name the task queue")
+}
+
+type recordingNexusRegistry struct {
+	services []*nexus.Service
+}
+
+func (r *recordingNexusRegistry) RegisterNexusService(service *nexus.Service) {
+	r.services = append(r.services, service)
+}
+
+func TestRegisterNexusServices_RegistersWhenActivitiesAreDisabled(t *testing.T) {
+	registry := &recordingNexusRegistry{}
+	handler := NewNexusHandler(nil, nil, zap.NewNop(), "default")
+	services := []internal.NexusServiceInfo{{
+		Name:       "billing",
+		Operations: []string{"charge"},
+	}}
+
+	err := registerNexusServices(registry, handler, "nexus-task-queue", services, zap.NewNop())
+
+	require.NoError(t, err)
+	require.Len(t, registry.services, 1)
+	assert.Equal(t, "billing", registry.services[0].Name)
+	assert.NotNil(t, registry.services[0].Operation("charge"))
 }
 
 func TestResolveDataConverters_EmptyMap_WithConfig(t *testing.T) {

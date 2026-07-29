@@ -30,16 +30,36 @@ Download the binaries with the following command: (from `tests/acceptance/php-sd
 composer get:binaries
 ```
 
-To build RoadRunner with the Temporal plugin, we also use DLoad. 
-It fetches the plugin version numbers from build.roadrunner.dev, generates the Velox configuration, and runs Velox to build RoadRunner with the current codebase.
-
-Run the following command to build RoadRunner: (from `tests/acceptance`)
-
-> **Note:** Before building, you must generate a GitHub Personal Access Token at https://github.com/settings/personal-access-tokens and use it as the `GITHUB_TOKEN` environment variable.
+To build a reproducible local RoadRunner with the Temporal plugin from this
+checkout, use the pinned direct-source builder:
 
 ```bash
-cd ..
-CGO_ENABLED=0 GITHUB_TOKEN=YOUR_TOKEN_HER php-sdk/vendor/bin/dload build
+./build-local.sh
+```
+
+It clones RoadRunner `v2025.1.15`, pins Go 1.26.4, replaces the bundled
+Temporal plugin with this repository, resolves the module graph, and writes
+`rr-nexus`. Override only when intentionally testing a different host release
+or output path:
+
+```bash
+ROADRUNNER_REF=v2025.1.15 ROADRUNNER_BINARY=/absolute/path/to/rr-nexus ./build-local.sh
+```
+
+The exact binary used by acceptance tests is
+`tests/acceptance/rr-nexus`. Point the PHP SDK at it with an absolute path to
+avoid ambiguity:
+
+```bash
+export ROADRUNNER_BINARY="$(pwd)/rr-nexus"
+```
+
+DLoad/Velox remains available for release-matrix builds. It requires an
+authenticated GitHub API token:
+
+```bash
+export DLOAD_BIN=./php-sdk/vendor/bin/dload
+GITHUB_TOKEN=... CGO_ENABLED=0 "$DLOAD_BIN" build --config ./dload.xml
 ```
 
 ### Running Tests
@@ -48,7 +68,7 @@ Navigate to the php-sdk directory and run the Acceptance or Functional tests usi
 
 ```bash
 cd php-sdk
-ROADRUNNER_BINARY='./rr' composer test:accept-fast
-ROADRUNNER_BINARY='./rr' composer test:accept-slow
-ROADRUNNER_BINARY='./rr' composer test:func
+ROADRUNNER_BINARY='../rr-nexus' composer test:accept-fast
+ROADRUNNER_BINARY='../rr-nexus' composer test:accept-slow
+ROADRUNNER_BINARY='../rr-nexus' composer test:func
 ```

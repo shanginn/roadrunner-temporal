@@ -110,12 +110,36 @@ func (p *Plugin) initPool() error {
 		return errors.Str("worker info should contain at least 1 worker")
 	}
 
+	// Nexus handlers execute in the activity pool even when ordinary activity
+	// polling is disabled. Keep one PHP process available for those requests.
+	if p.config.DisableActivityWorkers && HasNexusServices(wi) && len(ap.Workers()) == 0 {
+		if err := ap.AddWorker(); err != nil {
+			return errors.E(errors.Op("temporal_allocate_nexus_worker"), err)
+		}
+		p.log.Info("allocated PHP worker for Nexus services")
+	}
+
 	err = p.initTemporalClient(wi[0].PhpSdkVersion, wi[0].Flags, rrdc)
 	if err != nil {
 		return err
 	}
 
-	workers, err := aggregatedpool.TemporalWorkers(wfDef, actDef, aggregatedpool.NewNexusHandler(codec, ap, p.log, p.config.Namespace), wi, p.log, p.temporal.client, p.temporal.interceptors, p.config.Interceptors)
+	workers, err := aggregatedpool.TemporalWorkers(
+		wfDef,
+		actDef,
+		aggregatedpool.NewNexusHandlerWithCancellationRegistry(
+			codec,
+			ap,
+			p.log,
+			p.config.Namespace,
+			p.temporal.nexusMethodCancellations,
+		),
+		wi,
+		p.log,
+		p.temporal.client,
+		p.temporal.interceptors,
+		p.config.Interceptors,
+	)
 	if err != nil {
 		return err
 	}

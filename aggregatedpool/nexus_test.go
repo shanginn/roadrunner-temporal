@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/roadrunner-server/pool/payload"
 	staticPool "github.com/roadrunner-server/pool/pool/static_pool"
@@ -20,6 +21,7 @@ import (
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -154,6 +156,18 @@ func (c *recordingCodec) DecodeWorkerInfo(_ *payload.Payload, _ *[]*internal.Wor
 	return nil
 }
 
+// recordingPool is the workerless Pool fixture used by caller-side tests.
+type recordingPool struct{}
+
+func (*recordingPool) Exec(context.Context, *payload.Payload, chan struct{}) (chan *staticPool.PExec, error) {
+	panic("not used")
+}
+func (*recordingPool) Workers() []*poolWorker.Process     { return nil }
+func (*recordingPool) RemoveWorker(context.Context) error { panic("not used") }
+func (*recordingPool) AddWorker() error                   { panic("not used") }
+func (*recordingPool) QueueSize() uint64                  { return 0 }
+func (*recordingPool) Reset(context.Context) error        { panic("not used") }
+
 // ── Encoding behavior tests (no pool needed) ───────────────────────
 
 func TestStartOperation_EncodesTaskQueue(t *testing.T) {
@@ -181,6 +195,7 @@ func TestStartOperation_EncodesAllFields(t *testing.T) {
 		encodeErr: errors.New("stop after encode"),
 	}
 	handler := NewNexusHandler(codec, nil, zap.NewNop(), "default")
+	handler.endpoint = func(context.Context) string { return "orders-endpoint" }
 
 	_, _ = handler.startOperation(
 		context.Background(),
@@ -209,6 +224,7 @@ func TestStartOperation_EncodesAllFields(t *testing.T) {
 	assert.Equal(t, "myOp", cmd.Operation)
 	assert.Equal(t, "default", cmd.Namespace)
 	assert.Equal(t, "tq", cmd.TaskQueue)
+	assert.Equal(t, "orders-endpoint", cmd.Endpoint)
 	assert.Equal(t, "req-123", cmd.RequestID)
 	assert.Equal(t, "http://callback.example.com", cmd.Callback)
 	assert.Equal(t, "application/json", cmd.Headers["Content-Type"])
@@ -278,7 +294,8 @@ func TestStartOperation_EncodeErrorReturnsError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, result)
-	assert.Contains(t, err.Error(), "boom")
+	assert.Equal(t, nexusInternalHandlerErrorMessage, err.(*nexus.HandlerError).Message)
+	assert.NotContains(t, err.Error(), "boom")
 }
 
 func TestStartOperation_IncrementsSeqID(t *testing.T) {
@@ -361,6 +378,7 @@ func TestCancelOperation_EncodesAllFields(t *testing.T) {
 		encodeErr: errors.New("stop"),
 	}
 	handler := NewNexusHandler(codec, nil, zap.NewNop(), "default")
+	handler.endpoint = func(context.Context) string { return "orders-endpoint" }
 
 	_ = handler.cancelOperation(
 		context.Background(),
@@ -379,6 +397,7 @@ func TestCancelOperation_EncodesAllFields(t *testing.T) {
 	assert.Equal(t, "greet", cmd.Operation)
 	assert.Equal(t, "default", cmd.Namespace)
 	assert.Equal(t, "tq", cmd.TaskQueue)
+	assert.Equal(t, "orders-endpoint", cmd.Endpoint)
 	assert.Equal(t, "async-token-123", cmd.OperationToken)
 }
 
@@ -534,7 +553,8 @@ func TestCancelOperation_EncodeError(t *testing.T) {
 
 	err := handler.cancelOperation(context.Background(), "tq", "S", "o", "t", nexus.CancelOperationOptions{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "encode failed")
+	assert.Equal(t, nexusInternalHandlerErrorMessage, err.(*nexus.HandlerError).Message)
+	assert.NotContains(t, err.Error(), "encode failed")
 }
 
 // ── Concurrent seqID test ──────────────────────────────────────
@@ -584,64 +604,12 @@ func TestStartOperation_SetsInvocationID(t *testing.T) {
 	assert.NotZero(t, cmd.InvocationID)
 }
 
-// ── sendCancelMethod tests (requires a minimal Pool mock) ──────
+// ── Method cancellation registry ───────────────────────────────
 
-type recordingPool struct {
-	execCalls        int32
-	lastCtx          context.Context
-	lastCtxErrAtExec error
-	lastPld          *payload.Payload
-	execCh           chan struct{}
-}
-
-func (p *recordingPool) Exec(ctx context.Context, pld *payload.Payload, _ chan struct{}) (chan *staticPool.PExec, error) {
-	atomic.AddInt32(&p.execCalls, 1)
-	p.lastCtx = ctx
-	p.lastCtxErrAtExec = ctx.Err()
-	p.lastPld = pld
-	if p.execCh != nil {
-		<-p.execCh
-	}
-	ch := make(chan *staticPool.PExec, 1)
-	ch <- &staticPool.PExec{}
-	return ch, nil
-}
-
-func (p *recordingPool) Workers() []*poolWorker.Process     { return nil }
-func (p *recordingPool) RemoveWorker(context.Context) error { panic("not used") }
-func (p *recordingPool) AddWorker() error                   { panic("not used") }
-func (p *recordingPool) QueueSize() uint64                  { panic("not used") }
-func (p *recordingPool) Reset(context.Context) error        { panic("not used") }
-
-// sendCancelMethod must use a fresh context — the caller's ctx is the one
-// that was just cancelled, so reusing it would mean the cancel never lands.
-func TestSendCancelMethod_EncodesCorrectCommand(t *testing.T) {
-	codec := &mockCodec{}
-	pool := &recordingPool{}
-	handler := NewNexusHandler(codec, pool, zap.NewNop(), "default")
-
-	handler.sendCancelMethod(77, "deadline exceeded")
-
-	require.NotNil(t, codec.encodedMsg)
-	cmd, ok := codec.encodedMsg.Command.(internal.CancelNexusOperationMethod)
-	require.True(t, ok, "Command should be CancelNexusOperationMethod, got %T", codec.encodedMsg.Command)
-	assert.Equal(t, uint64(77), cmd.InvocationID)
-	assert.Equal(t, "deadline exceeded", cmd.Reason)
-
-	assert.EqualValues(t, 1, atomic.LoadInt32(&pool.execCalls))
-	require.NotNil(t, pool.lastCtx)
-	assert.NoError(t, pool.lastCtxErrAtExec, "sendCancelMethod must use a live ctx at Exec time")
-}
-
-// ctx cancel while a Nexus invocation is in-flight must emit a
-// CancelNexusOperationMethod so the PHP-side handler stops promptly.
-func TestStartOperation_CtxCancelTriggersMethodCancel(t *testing.T) {
-	codec := &mockCodec{}
-	pool := &recordingPool{}
-	handler := NewNexusHandler(codec, pool, zap.NewNop(), "default")
-
-	handler.inFlight.Store(uint64(5), struct{}{})
-	defer handler.inFlight.Delete(uint64(5))
+func TestStartOperation_CtxCancelMarksSharedRegistry(t *testing.T) {
+	registry := new(NexusMethodCancellationRegistry)
+	registry.Register(5)
+	handler := NewNexusHandlerWithCancellationRegistry(nil, nil, zap.NewNop(), "default", registry)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -655,17 +623,16 @@ func TestStartOperation_CtxCancelTriggersMethodCancel(t *testing.T) {
 	cancel()
 	<-finished
 
-	require.NotNil(t, codec.encodedMsg)
-	cmd, ok := codec.encodedMsg.Command.(internal.CancelNexusOperationMethod)
-	require.True(t, ok, "expected CancelNexusOperationMethod, got %T", codec.encodedMsg.Command)
-	assert.Equal(t, uint64(5), cmd.InvocationID)
-	assert.Contains(t, cmd.Reason, "canceled")
+	state, ok := registry.Lookup(5)
+	require.True(t, ok)
+	assert.True(t, state.Cancelled)
+	assert.Contains(t, state.Reason, "canceled")
 }
 
 func TestStartOperation_DoneClosedSkipsMethodCancel(t *testing.T) {
-	codec := &mockCodec{}
-	pool := &recordingPool{}
-	handler := NewNexusHandler(codec, pool, zap.NewNop(), "default")
+	registry := new(NexusMethodCancellationRegistry)
+	registry.Register(5)
+	handler := NewNexusHandlerWithCancellationRegistry(nil, nil, zap.NewNop(), "default", registry)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -680,16 +647,16 @@ func TestStartOperation_DoneClosedSkipsMethodCancel(t *testing.T) {
 	close(done)
 	<-finished
 
-	assert.Nil(t, codec.encodedMsg, "no cancel should have been emitted")
-	assert.EqualValues(t, 0, atomic.LoadInt32(&pool.execCalls))
+	state, ok := registry.Lookup(5)
+	require.True(t, ok)
+	assert.False(t, state.Cancelled)
 }
 
-// Race guard: ctx cancels AFTER the invocation completed (inFlight already
-// cleared). Watcher must swallow the cancel rather than target a gone handler.
+// Race guard: ctx cancels after the invocation was discarded. The watcher must
+// not recreate completed state.
 func TestStartOperation_CtxCancelAfterCompletionNoop(t *testing.T) {
-	codec := &mockCodec{}
-	pool := &recordingPool{}
-	handler := NewNexusHandler(codec, pool, zap.NewNop(), "default")
+	registry := new(NexusMethodCancellationRegistry)
+	handler := NewNexusHandlerWithCancellationRegistry(nil, nil, zap.NewNop(), "default", registry)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -703,21 +670,101 @@ func TestStartOperation_CtxCancelAfterCompletionNoop(t *testing.T) {
 	cancel()
 	<-finished
 
-	assert.Nil(t, codec.encodedMsg, "cancel must be swallowed when inFlight entry is absent")
+	_, ok := registry.Lookup(777)
+	assert.False(t, ok)
 }
 
-// sendCancelMethod is fire-and-forget — encode failures are logged, never propagated.
-func TestSendCancelMethod_EncodeErrorSwallowed(t *testing.T) {
-	codec := &mockCodec{encodeErr: errors.New("encode boom")}
-	pool := &recordingPool{}
-	handler := NewNexusHandler(codec, pool, zap.NewNop(), "default")
+// blockingPool models both failure modes of the old second-Exec design:
+// with one PHP worker it queues behind Start; with more workers it is free to
+// select a different process whose PHP-local registry cannot know the ID.
+type blockingPool struct {
+	execCalls   int32
+	started     chan struct{}
+	release     chan struct{}
+	secondExec  chan struct{}
+	execContext chan context.Context
+}
 
-	handler.sendCancelMethod(1, "x")
+func newBlockingPool() *blockingPool {
+	return &blockingPool{
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+		secondExec:  make(chan struct{}),
+		execContext: make(chan context.Context, 1),
+	}
+}
 
-	assert.EqualValues(t, 0, atomic.LoadInt32(&pool.execCalls))
+func (p *blockingPool) Exec(ctx context.Context, _ *payload.Payload, _ chan struct{}) (chan *staticPool.PExec, error) {
+	call := atomic.AddInt32(&p.execCalls, 1)
+	if call == 1 {
+		p.execContext <- ctx
+		close(p.started)
+		<-p.release
+		return nil, errors.New("release blocked Start")
+	}
+
+	select {
+	case <-p.secondExec:
+	default:
+		close(p.secondExec)
+	}
+	return nil, errors.New("unexpected non-affine Exec")
+}
+
+func (p *blockingPool) Workers() []*poolWorker.Process     { return nil }
+func (p *blockingPool) RemoveWorker(context.Context) error { panic("not used") }
+func (p *blockingPool) AddWorker() error                   { panic("not used") }
+func (p *blockingPool) QueueSize() uint64                  { return 0 }
+func (p *blockingPool) Reset(context.Context) error        { panic("not used") }
+
+func TestStartOperation_ContextCancelNeverDispatchesSecondPoolRequest(t *testing.T) {
+	codec := &mockCodec{}
+	pool := newBlockingPool()
+	registry := new(NexusMethodCancellationRegistry)
+	handler := NewNexusHandlerWithCancellationRegistry(codec, pool, zap.NewNop(), "default", registry)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := handler.startOperation(ctx, "tq", "S", "o", nil, nexus.StartOperationOptions{})
+		result <- err
+	}()
+
+	<-pool.started
+	execCtx := <-pool.execContext
+	cmd, ok := codec.encodedMsg.Command.(internal.InvokeNexusOperation)
+	require.True(t, ok)
+	cancel()
+
+	assert.NoError(t, execCtx.Err(), "method cancellation must not cancel the PHP pool dispatch")
+	assert.Nil(t, execCtx.Done(), "Start must use a detached pool context")
+	_, hasDeadline := execCtx.Deadline()
+	assert.False(t, hasDeadline, "the pool owns allocation and execution hard limits")
+
+	require.Eventually(t, func() bool {
+		state, found := registry.Lookup(cmd.InvocationID)
+		return found && state.Cancelled
+	}, time.Second, time.Millisecond)
+
+	select {
+	case <-pool.secondExec:
+		t.Fatal("context cancellation dispatched a second, non-process-affine pool request")
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.EqualValues(t, 1, atomic.LoadInt32(&pool.execCalls))
+
+	close(pool.release)
+	require.Error(t, <-result)
+
+	_, found := registry.Lookup(cmd.InvocationID)
+	assert.False(t, found, "Start completion must discard registry state")
 }
 
 // ── Failure → Nexus error mapping ──────────────────────────────────
+
+func nexusErrorFromFailureForTest(f *failurepb.Failure) error {
+	return NewNexusHandler(nil, nil, zap.NewNop(), "default").nexusErrorFromFailure(f)
+}
 
 func TestNexusErrorFromFailure_HandlerFailureInfoPreservesType(t *testing.T) {
 	f := &failurepb.Failure{
@@ -730,7 +777,7 @@ func TestNexusErrorFromFailure_HandlerFailureInfoPreservesType(t *testing.T) {
 		},
 	}
 
-	err := nexusErrorFromFailure(f)
+	err := nexusErrorFromFailureForTest(f)
 
 	he, ok := err.(*nexus.HandlerError)
 	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
@@ -750,7 +797,7 @@ func TestNexusErrorFromFailure_RetryBehaviorRetryable(t *testing.T) {
 		},
 	}
 
-	err := nexusErrorFromFailure(f)
+	err := nexusErrorFromFailureForTest(f)
 	he := err.(*nexus.HandlerError)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorRetryable, he.RetryBehavior)
@@ -766,7 +813,7 @@ func TestNexusErrorFromFailure_RetryBehaviorUnspecifiedDefaults(t *testing.T) {
 		},
 	}
 
-	he := nexusErrorFromFailure(f).(*nexus.HandlerError)
+	he := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
 	assert.Equal(t, nexus.HandlerErrorTypeNotFound, he.Type)
 	assert.Equal(t, nexus.HandlerErrorRetryBehaviorUnspecified, he.RetryBehavior)
 }
@@ -799,7 +846,7 @@ func TestNexusErrorFromFailure_AllSpecErrorTypesRoundTrip(t *testing.T) {
 					},
 				},
 			}
-			he := nexusErrorFromFailure(f).(*nexus.HandlerError)
+			he := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
 			assert.Equal(t, c.want, he.Type)
 		})
 	}
@@ -815,7 +862,7 @@ func TestNexusErrorFromFailure_OperationErrorFailed(t *testing.T) {
 		},
 	}
 
-	err := nexusErrorFromFailure(f)
+	err := nexusErrorFromFailureForTest(f)
 	oe, ok := err.(*nexus.OperationError)
 	require.True(t, ok, "expected *nexus.OperationError, got %T", err)
 	assert.Equal(t, nexus.OperationStateFailed, oe.State)
@@ -832,7 +879,7 @@ func TestNexusErrorFromFailure_OperationErrorCanceled(t *testing.T) {
 		},
 	}
 
-	oe := nexusErrorFromFailure(f).(*nexus.OperationError)
+	oe := nexusErrorFromFailureForTest(f).(*nexus.OperationError)
 	assert.Equal(t, nexus.OperationStateCanceled, oe.State)
 	assert.Equal(t, "user canceled", oe.Message)
 }
@@ -847,7 +894,7 @@ func TestNexusErrorFromFailure_OperationErrorUnknownStateFallsBackToFailed(t *te
 		},
 	}
 
-	oe := nexusErrorFromFailure(f).(*nexus.OperationError)
+	oe := nexusErrorFromFailureForTest(f).(*nexus.OperationError)
 	assert.Equal(t, nexus.OperationStateFailed, oe.State, "unknown state must not leak to the wire")
 }
 
@@ -861,19 +908,21 @@ func TestNexusErrorFromFailure_UntaggedApplicationFailureFallsBackToInternal(t *
 		},
 	}
 
-	he, ok := nexusErrorFromFailure(f).(*nexus.HandlerError)
+	he, ok := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
 	require.True(t, ok)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type, "unknown failure shape must collapse to Internal")
-	assert.Equal(t, "boom", he.Message)
+	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
+	assert.Nil(t, he.Cause)
 }
 
 func TestNexusErrorFromFailure_NoFailureInfoIsInternal(t *testing.T) {
 	f := &failurepb.Failure{Message: "bare failure"}
 
-	he, ok := nexusErrorFromFailure(f).(*nexus.HandlerError)
+	he, ok := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
 	require.True(t, ok)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
-	assert.Equal(t, "bare failure", he.Message)
+	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
+	assert.Nil(t, he.Cause)
 }
 
 // ── RetryBehavior enum mapping ──────────────────────────────────────
@@ -898,19 +947,19 @@ func TestMapNexusRetryBehavior_AllValues(t *testing.T) {
 
 // ── Failure-cause preservation (round-trip via failureHolder) ──
 
-func TestNexusErrorFromFailure_HandlerErrorPreservesCauseProto(t *testing.T) {
+func TestNexusErrorFromFailure_PublicHandlerErrorPreservesCauseProto(t *testing.T) {
 	f := &failurepb.Failure{
 		Message:    "boom",
 		StackTrace: "#0 /app/Handler.php(42): run()\n#1 {main}",
 		FailureInfo: &failurepb.Failure_NexusHandlerFailureInfo{
 			NexusHandlerFailureInfo: &failurepb.NexusHandlerFailureInfo{
-				Type:          "INTERNAL",
-				RetryBehavior: enumspb.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE,
+				Type:          "BAD_REQUEST",
+				RetryBehavior: enumspb.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE,
 			},
 		},
 	}
 
-	he := nexusErrorFromFailure(f).(*nexus.HandlerError)
+	he := nexusErrorFromFailureForTest(f).(*nexus.HandlerError)
 	assert.Equal(t, "boom", he.Message)
 
 	roundTripped := temporal.GetDefaultFailureConverter().ErrorToFailure(he.Cause)
@@ -918,7 +967,7 @@ func TestNexusErrorFromFailure_HandlerErrorPreservesCauseProto(t *testing.T) {
 		"Cause must hold the original proto verbatim;\nwant: %v\ngot:  %v", f, roundTripped)
 }
 
-func TestNexusErrorFromFailure_HandlerErrorPreservesNestedCauseProto(t *testing.T) {
+func TestNexusErrorFromFailure_PublicHandlerErrorPreservesNestedCauseProto(t *testing.T) {
 	inner := &failurepb.Failure{
 		Message:    "db connection failed",
 		StackTrace: "at Db->connect()",
@@ -931,14 +980,35 @@ func TestNexusErrorFromFailure_HandlerErrorPreservesNestedCauseProto(t *testing.
 		StackTrace: "at EchoService->echo()",
 		Cause:      inner,
 		FailureInfo: &failurepb.Failure_NexusHandlerFailureInfo{
+			NexusHandlerFailureInfo: &failurepb.NexusHandlerFailureInfo{Type: "BAD_REQUEST"},
+		},
+	}
+
+	he := nexusErrorFromFailureForTest(outer).(*nexus.HandlerError)
+	roundTripped := temporal.GetDefaultFailureConverter().ErrorToFailure(he.Cause)
+	assert.True(t, proto.Equal(outer, roundTripped),
+		"recursive cause chain must survive round-trip;\nwant: %v\ngot:  %v", outer, roundTripped)
+}
+
+func TestNexusErrorFromFailure_InternalCauseIsLoggedAndHidden(t *testing.T) {
+	core, logs := observer.New(zap.ErrorLevel)
+	handler := NewNexusHandler(nil, nil, zap.New(core), "default")
+	f := &failurepb.Failure{
+		Message:    "database password=secret",
+		StackTrace: "/srv/private/Handler.php:42",
+		FailureInfo: &failurepb.Failure_NexusHandlerFailureInfo{
 			NexusHandlerFailureInfo: &failurepb.NexusHandlerFailureInfo{Type: "INTERNAL"},
 		},
 	}
 
-	he := nexusErrorFromFailure(outer).(*nexus.HandlerError)
-	roundTripped := temporal.GetDefaultFailureConverter().ErrorToFailure(he.Cause)
-	assert.True(t, proto.Equal(outer, roundTripped),
-		"recursive cause chain must survive round-trip;\nwant: %v\ngot:  %v", outer, roundTripped)
+	he := handler.nexusErrorFromFailure(f).(*nexus.HandlerError)
+
+	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
+	assert.NotContains(t, he.Error(), "password=secret")
+	assert.Nil(t, he.Cause)
+	require.Len(t, logs.All(), 1)
+	assert.Contains(t, logs.All()[0].ContextMap()["detail"], "password=secret")
+	assert.Contains(t, logs.All()[0].ContextMap()["cause"], "password=secret")
 }
 
 func TestNexusErrorFromFailure_OperationErrorPreservesCauseProto(t *testing.T) {
@@ -969,7 +1039,7 @@ func TestNexusErrorFromFailure_OperationErrorPreservesCauseProto(t *testing.T) {
 		},
 	}
 
-	oe := nexusErrorFromFailure(outer).(*nexus.OperationError)
+	oe := nexusErrorFromFailureForTest(outer).(*nexus.OperationError)
 	assert.Equal(t, nexus.OperationStateFailed, oe.State)
 	assert.Equal(t, "outer-business-error", oe.Message)
 
@@ -1105,7 +1175,8 @@ func TestDecodeStartReply_NilCommandWithFailureRoutesToMapping(t *testing.T) {
 	require.Error(t, err)
 	he, ok := err.(*nexus.HandlerError)
 	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
-	assert.Equal(t, "boom", he.Message)
+	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
+	assert.NotContains(t, he.Error(), "boom")
 }
 
 // nil Command + nil Failure: malformed reply → HandlerError(Internal).
@@ -1118,7 +1189,7 @@ func TestDecodeStartReply_EmptyReplyIsHandlerError(t *testing.T) {
 	he, ok := err.(*nexus.HandlerError)
 	require.True(t, ok, "expected *nexus.HandlerError, got %T", err)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
-	assert.Contains(t, he.Message, "neither command nor failure")
+	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 }
 
 // Unknown reply command → HandlerError(Internal). Defends against PHP
@@ -1134,5 +1205,5 @@ func TestDecodeStartReply_UnknownCommandIsHandlerError(t *testing.T) {
 	he, ok := err.(*nexus.HandlerError)
 	require.True(t, ok)
 	assert.Equal(t, nexus.HandlerErrorTypeInternal, he.Type)
-	assert.Contains(t, he.Message, "unexpected")
+	assert.Equal(t, nexusInternalHandlerErrorMessage, he.Message)
 }

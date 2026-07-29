@@ -13,7 +13,7 @@ func (p *Plugin) Status() (*status.Status, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if p.config.DisableActivityWorkers && len(p.wfP.Workers()) > 0 && p.wfP.Workers()[0].State().IsActive() {
+	if p.config.DisableActivityWorkers && len(p.temporal.nexusServices) == 0 && len(p.wfP.Workers()) > 0 && p.wfP.Workers()[0].State().IsActive() {
 		return &status.Status{
 			Code: http.StatusOK,
 		}, nil
@@ -39,7 +39,7 @@ func (p *Plugin) Ready() (*status.Status, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if p.config.DisableActivityWorkers && len(p.wfP.Workers()) > 0 && p.wfP.Workers()[0].State().Compare(fsm.StateReady) {
+	if p.config.DisableActivityWorkers && len(p.temporal.nexusServices) == 0 && len(p.wfP.Workers()) > 0 && p.wfP.Workers()[0].State().Compare(fsm.StateReady) {
 		return &status.Status{
 			Code: http.StatusOK,
 		}, nil

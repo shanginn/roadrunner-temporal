@@ -2,6 +2,8 @@ package registry
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -101,8 +103,9 @@ func TestNexusStartedRegistry_DistinctIDs(t *testing.T) {
 	assert.True(t, firedB)
 }
 
-// Repeated Push for the same ID overwrites — late Listen sees only the latest entry.
-func TestNexusStartedRegistry_OverwriteEntry(t *testing.T) {
+// Repeated Push for the same ID is ignored — the first callback result is the
+// deterministic one consumed by a late listener.
+func TestNexusStartedRegistry_FirstPushWins(t *testing.T) {
 	r := &NexusStartedRegistry{}
 
 	r.Push(5, "first", nil)
@@ -112,11 +115,12 @@ func TestNexusStartedRegistry_OverwriteEntry(t *testing.T) {
 	r.Listen(5, func(token string, err error) {
 		gotToken = token
 	})
-	assert.Equal(t, "second", gotToken)
+	assert.Equal(t, "first", gotToken)
 }
 
-// Second Listen for the same ID wins — Push must reach only the most recent listener.
-func TestNexusStartedRegistry_ListenReplacesListener(t *testing.T) {
+// A duplicate listener is ignored so the callback target cannot change based
+// on goroutine scheduling.
+func TestNexusStartedRegistry_FirstListenerWins(t *testing.T) {
 	r := &NexusStartedRegistry{}
 
 	var firedFirst, firedSecond bool
@@ -125,8 +129,8 @@ func TestNexusStartedRegistry_ListenReplacesListener(t *testing.T) {
 
 	r.Push(8, "tok", nil)
 
-	assert.False(t, firedFirst, "replaced listener must not fire")
-	assert.True(t, firedSecond)
+	assert.True(t, firedFirst)
+	assert.False(t, firedSecond, "duplicate listener must not fire")
 }
 
 // After Discard, a late Listen must NOT see the previously-pushed entry.
@@ -168,4 +172,61 @@ func TestNexusStartedRegistry_DiscardIdempotent(t *testing.T) {
 	r.Push(303, "tok", nil)
 	r.Discard(303)
 	assert.NotPanics(t, func() { r.Discard(303) })
+}
+
+func TestNexusStartedRegistry_ConcurrentPushAndListenConsumesOnce(t *testing.T) {
+	const iterations = 10_000
+
+	r := &NexusStartedRegistry{}
+	counts := make([]atomic.Int32, iterations)
+	var pair sync.WaitGroup
+	pair.Add(iterations * 2)
+
+	for i := range iterations {
+		id := uint64(i + 1)
+		go func() {
+			defer pair.Done()
+			r.Listen(id, func(string, error) {
+				counts[i].Add(1)
+			})
+		}()
+		go func() {
+			defer pair.Done()
+			r.Push(id, "token", nil)
+		}()
+	}
+
+	pair.Wait()
+	for i := range iterations {
+		assert.Equalf(t, int32(1), counts[i].Load(), "id %d must be consumed exactly once", i+1)
+	}
+}
+
+func TestNexusStartedRegistry_CallbackCanDiscardWithoutDeadlock(t *testing.T) {
+	r := &NexusStartedRegistry{}
+	done := make(chan struct{})
+
+	r.Listen(404, func(string, error) {
+		r.Discard(404)
+		close(done)
+	})
+	r.Push(404, "token", nil)
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("callback did not complete")
+	}
+}
+
+func TestNexusStartedRegistry_ConsumedIDCannotBeReopened(t *testing.T) {
+	r := &NexusStartedRegistry{}
+	var calls atomic.Int32
+
+	r.Listen(505, func(string, error) { calls.Add(1) })
+	r.Push(505, "first", nil)
+	r.Push(505, "second", nil)
+	r.Listen(505, func(string, error) { calls.Add(1) })
+
+	assert.Equal(t, int32(1), calls.Load())
 }

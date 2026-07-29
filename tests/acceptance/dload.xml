@@ -6,9 +6,9 @@
     <actions>
         <download software="velox" />
         <velox config-file="./velox.toml"
-               velox-version="2025.1.4"
-               roadrunner-ref="v2025.1.4"
-               binary-path="./php-sdk/rr"
+               velox-version="2025.1.7"
+               roadrunner-ref="v2025.1.15"
+               binary-path="./rr-nexus"
         >
             <plugin name="temporal" replace="../.."/>
             <plugin name="rpc"/>

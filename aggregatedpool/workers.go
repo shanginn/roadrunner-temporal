@@ -132,6 +132,25 @@ func registerNexusService(register func(), service, taskQueue string) (err error
 	return nil
 }
 
+func registerNexusServices(registry worker.NexusServiceRegistry, handler *NexusHandler, taskQueue string, services []internal.NexusServiceInfo, log *zap.Logger) error {
+	if handler == nil {
+		return nil
+	}
+
+	for _, ns := range services {
+		err := registerNexusService(func() {
+			registry.RegisterNexusService(handler.CreateNexusService(taskQueue, ns.Name, ns.Operations))
+		}, ns.Name, taskQueue)
+		if err != nil {
+			return err
+		}
+
+		log.Debug("nexus service registered", zap.String(tq, taskQueue), zap.String("service", ns.Name), zap.Strings("ops", ns.Operations))
+	}
+
+	return nil
+}
+
 func TemporalWorkers(wDef *Workflow, actDef *Activity, nexusHandler *NexusHandler, wi []*internal.WorkerInfo, log *zap.Logger, tc temporalClient.Client, interceptors map[string]api.Interceptor, configuredInterceptors []string) ([]worker.Worker, error) {
 	resolved, err := ResolveInterceptors(interceptors, configuredInterceptors)
 	if err != nil {
@@ -179,17 +198,8 @@ func TemporalWorkers(wDef *Workflow, actDef *Activity, nexusHandler *NexusHandle
 			log.Debug("workflow registered", zap.String(tq, wi[i].TaskQueue), zap.Any("workflow name", wf.Name), zap.Int("versioning_behavior", int(wf.VersioningBehavior)))
 		}
 
-		if nexusHandler != nil && len(wi[i].NexusServices) > 0 {
-			for _, ns := range wi[i].NexusServices {
-				err := registerNexusService(func() {
-					wrk.RegisterNexusService(nexusHandler.CreateNexusService(wi[i].TaskQueue, ns.Name, ns.Operations))
-				}, ns.Name, wi[i].TaskQueue)
-				if err != nil {
-					return nil, err
-				}
-
-				log.Debug("nexus service registered", zap.String(tq, wi[i].TaskQueue), zap.String("service", ns.Name), zap.Strings("ops", ns.Operations))
-			}
+		if err := registerNexusServices(wrk, nexusHandler, wi[i].TaskQueue, wi[i].NexusServices, log); err != nil {
+			return nil, err
 		}
 
 		if actDef.disableActivityWorkers {

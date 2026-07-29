@@ -47,6 +47,18 @@ type RecordHeartbeatResponse struct {
 	Paused   bool `json:"paused"`
 }
 
+// NexusMethodCancellationRequest identifies an in-flight handler Start call.
+type NexusMethodCancellationRequest struct {
+	InvocationID uint64 `json:"invocationId"`
+}
+
+// NexusMethodCancellationResponse is a non-consuming snapshot. Unknown and
+// already-completed invocation IDs are reported as not cancelled.
+type NexusMethodCancellationResponse struct {
+	Cancelled bool   `json:"cancelled"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // RecordActivityHeartbeat records heartbeat for an activity.
 // taskToken - is the value of the binary "TaskToken" field of the "ActivityInfo" struct retrieved inside the activity.
 // details - is the progress you want to record along with heart beat for this activity.
@@ -124,6 +136,29 @@ func (r *rpc) GetNexusServiceNames(_ bool, out *[]string) error {
 		*out = append(*out, k)
 	}
 
+	return nil
+}
+
+// GetNexusMethodCancellation lets the PHP process executing a Nexus Start
+// cooperatively poll its Go handler context. This uses RoadRunner's independent
+// RPC transport; it must not be routed through the single-request PHP pool.
+func (r *rpc) GetNexusMethodCancellation(in NexusMethodCancellationRequest, out *NexusMethodCancellationResponse) error {
+	registry := r.plugin.temporal.nexusMethodCancellations
+	if registry == nil || in.InvocationID == 0 {
+		*out = NexusMethodCancellationResponse{}
+		return nil
+	}
+
+	state, ok := registry.Lookup(in.InvocationID)
+	if !ok {
+		*out = NexusMethodCancellationResponse{}
+		return nil
+	}
+
+	*out = NexusMethodCancellationResponse{
+		Cancelled: state.Cancelled,
+		Reason:    state.Reason,
+	}
 	return nil
 }
 
