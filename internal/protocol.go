@@ -382,6 +382,7 @@ type InvokeNexusOperation struct {
 	Operation       string            `json:"operation"`
 	Namespace       string            `json:"namespace,omitempty"`
 	TaskQueue       string            `json:"taskQueue,omitempty"`
+	Endpoint        string            `json:"endpoint,omitempty"`
 	RequestID       string            `json:"requestId"`
 	Callback        string            `json:"callback,omitempty"`
 	CallbackHeaders map[string]string `json:"callbackHeaders,omitempty"`
@@ -404,6 +405,7 @@ type CancelNexusOperation struct {
 	Operation      string `json:"operation"`
 	Namespace      string `json:"namespace,omitempty"`
 	TaskQueue      string `json:"taskQueue,omitempty"`
+	Endpoint       string `json:"endpoint,omitempty"`
 	OperationToken string `json:"operationToken"`
 	// Raw HTTP-style headers from the caller's cancel request, propagated to the
 	// handler's OperationContext. Symmetric with ExecuteNexusOperation.NexusHeaders.

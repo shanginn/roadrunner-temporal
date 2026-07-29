@@ -351,6 +351,29 @@ func TestCancelNexusOperation_MarshalsTaskQueue(t *testing.T) {
 	assert.NotContains(t, string(out), "taskQueue", "empty task queue must be omitted")
 }
 
+func TestNexusHandlerCommands_MarshalEndpoint(t *testing.T) {
+	start, err := json.Marshal(InvokeNexusOperation{
+		Service:   "billing",
+		Operation: "charge",
+		Endpoint:  "payments-endpoint",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(start), `"endpoint":"payments-endpoint"`)
+
+	cancel, err := json.Marshal(CancelNexusOperation{
+		Service:        "billing",
+		Operation:      "charge",
+		Endpoint:       "payments-endpoint",
+		OperationToken: "token",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(cancel), `"endpoint":"payments-endpoint"`)
+
+	empty, err := json.Marshal(InvokeNexusOperation{Service: "s", Operation: "o"})
+	require.NoError(t, err)
+	assert.NotContains(t, string(empty), "endpoint")
+}
+
 // Cancel-request headers are forwarded under `headers` (symmetric with start).
 func TestCancelNexusOperation_MarshalsHeaders(t *testing.T) {
 	out, err := json.Marshal(CancelNexusOperation{
